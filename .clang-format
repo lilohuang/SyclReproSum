@@ -1,0 +1,30 @@
+# C++ style for SyclReproSum
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++17
+
+# 3-space indentation
+IndentWidth: 3
+TabWidth: 3
+UseTab: Never
+AccessModifierOffset: -3
+ContinuationIndentWidth: 3
+
+# Asterisk/ampersand bind to the variable name: int *p, int &r
+PointerAlignment: Right
+ReferenceAlignment: Right
+DerivePointerAlignment: false
+
+# Every if/else/for/while body gets braces, even single statements
+InsertBraces: true
+
+ColumnLimit: 80
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Inline
+BreakBeforeBraces: Attach
+IndentCaseLabels: true
+SortIncludes: false
+AlignTrailingComments: true
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
