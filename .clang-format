@@ -9,6 +9,10 @@ TabWidth: 3
 UseTab: Never
 AccessModifierOffset: -3
 ContinuationIndentWidth: 3
+AlignAfterOpenBracket: DontAlign
+AlignOperands: DontAlign
+ConstructorInitializerIndentWidth: 3
+LambdaBodyIndentation: OuterScope
 
 # Asterisk/ampersand bind to the variable name: int *p, int &r
 PointerAlignment: Right

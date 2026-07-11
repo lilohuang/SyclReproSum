@@ -30,6 +30,7 @@ git clone --recursive https://github.com/lilohuang/SyclReproSum.git
 cd SyclReproSum
 make all          # build example + tests (see README for DPCPP_HOME)
 make test         # run the Google Test suite
+make test-validation  # run hostile host/device validation checks
 ```
 
 All tests must pass on every available GPU (the suite is

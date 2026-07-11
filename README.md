@@ -6,17 +6,18 @@ algorithm, with primitives adapted from the
 [ReproBLAS](https://bebop.cs.berkeley.edu/reproblas/) reference
 implementation.
 
-- **Bit-reproducible** - the sum is exactly the same bits on every run,
-  for any input order, work-group size, or thread scheduling.
-- **Cross-device** - CPU, NVIDIA GPU, and Intel GPU all produce
-  *identical* results from the same input, across CUDA, Level-Zero,
-  and OpenCL backends.
-- **Single pass** - no max-scan or second sweep; the data is read once,
-  reaching up to ~75% of the plain `sycl::reduction` bandwidth ceiling
-  on GPU.
+- **Bit-reproducible** - within the documented accumulator capacity, the sum
+  is exactly the same bits on every run, for any input order, supported
+  work-group size, or thread scheduling on a validated device.
+- **Cross-device** - validated CPU, NVIDIA GPU, and Intel GPU devices produce
+  *identical* results from the same input; this is tested here across CUDA,
+  Level-Zero, and OpenCL backends.
+- **Single pass** - no max-scan or second sweep; the accumulation kernel reads
+  the device input once and approaches the plain `sycl::reduction` throughput
+  baseline on the tested NVIDIA GPU.
 - **Robust** - Inf/NaN propagate deterministically using a fixed canonical
-  quiet NaN, subnormals are handled, and accuracy is bounded (~2^-80 for
-  double at the default K=3) even under catastrophic cancellation.
+  quiet NaN, subnormals are handled, and the dominant binned absolute-error
+  term at the default K=3 is proportional to N * 2^-80 * max|x| for double.
 - **Easy to adopt** - one header, one function (`adn::sum`), `float`
   and `double`, C++17.
 
@@ -25,17 +26,15 @@ implementation.
 Parallel floating-point reduction is **non-deterministic** - different
 thread scheduling orders produce different rounding errors, and different
 hardware (CPU vs GPU, NVIDIA vs Intel) produces different answers for the
-same data. The Ahrens-Demmel-Nguyen binned format solves this by
-depositing every value into K accumulators aligned to a fixed grid of
-exponent bins, making the result **independent of execution order and of
-the device it ran on** - whether that device is a multi-core CPU or a
-discrete GPU.
+same data. Within its documented accumulator capacity, the
+Ahrens-Demmel-Nguyen binned format solves this by depositing every value into
+K accumulators aligned to a fixed grid of exponent bins, making the result
+**independent of execution order and of the device it ran on** - whether that
+device is a multi-core CPU or a discrete GPU.
 
 ```
-Naive parallel sum of [1e16, 1.0, 1.0, ..., -1e16]  ->  unpredictable; varies
-                                                        run-to-run and device-to-device
-SyclReproSum of the same data                        ->  always the same bits, on
-                                                        any CPU or GPU from any vendor
+Naive parallel sum  ->  varies by run and device
+SyclReproSum        ->  same bits on every validated device
 ```
 
 ## Quick Start
@@ -49,7 +48,7 @@ A complete, runnable program (see [example.cpp](example.cpp), built by
 #include "repro_sum.hpp"
 
 int main() {
-   // Works with any device: gpu_selector_v, cpu_selector_v, or default
+   // Use any validated fp64-capable SYCL device.
    sycl::queue q{sycl::gpu_selector_v};
 
    // 1e16 +/- pairs cancel exactly; the true sum is the 10000 ones.
@@ -71,15 +70,21 @@ int main() {
 More API variants:
 
 ```cpp
-// Device pointer (zero-copy, T deduced):
+// Assume q, N, and initialized host_ptr are already available.
+
+// Device pointer (no library-side copy, T deduced):
 double *d_ptr = sycl::malloc_device<double>(N, q);
+q.memcpy(d_ptr, host_ptr, N * sizeof(double)).wait();
 double result = adn::sum(q, d_ptr, N);
 
 // Host pointer (auto-copied to device):
 double result = adn::sum(q, host_ptr, N);
 
-// Shared USM pointer (zero-copy):
+// Shared USM pointer (populate before summing; no library-side copy):
 float *s_ptr = sycl::malloc_shared<float>(N, q);
+for (std::size_t i = 0; i < N; ++i) {
+   s_ptr[i] = 1.0f;
+}
 float result = adn::sum(q, s_ptr, N);
 
 // More folds for higher accuracy:
@@ -91,24 +96,27 @@ double result = adn::sum<3, 512>(q, ptr, N);
 
 ## Performance
 
-Single pass over the data, 100M elements, average of 10 runs. Throughput
-is measured in GElements/s (billions of input elements processed per
-second, where 1 GElements/s = 10^9 elements/s), so `double` and `float`
-can be compared without the element-size bias of GB/s:
+Single pass over the data, 100M elements. The values below are the mean
+of three benchmark invocations, each measured as the average of 10 runs
+after one warmup run. Throughput is measured in GElements/s (billions of
+input elements processed per second, where 1 GElements/s = 10^9
+elements/s), so `double` and `float` can be compared without the
+element-size bias of GB/s:
 
-| Device (backend) | `double` sum / ceiling* (GElements/s) | `float` sum / ceiling* (GElements/s) |
+| Device (backend) | `double` sum / baseline* (GElements/s) | `float` sum / baseline* (GElements/s) |
 |---|---:|---:|
-| NVIDIA RTX PRO 4500 (CUDA) | 42.4 / 78.4 (1.8x slower) | 96.7 / 131.9 (1.4x slower) |
-| Intel Meteor Lake iGPU (OpenCL) | 1.7 / 6.0 (3.5x slower) | 3.7 / 11.6 (3.1x slower) |
-| Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.8 (14.5x slower) | 0.6 / 7.6 (12.7x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA) | 48.7 / 77.0 (1.6x slower) | 121.2 / 124.5 (1.0x slower) |
+| Intel Graphics [0x7d67] (Level-Zero) | 1.7 / 6.6 (3.8x slower) | 4.1 / 12.5 (3.0x slower) |
+| Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.8 (13.6x slower) | 0.6 / 7.4 (12.3x slower) |
 
-*Ceiling = plain (non-reproducible) `sycl::reduction` of the same data
-type on the same device. The gap is the algorithm's inherent cost: each
-deposit is a chain of K+1 dependent FP additions, which buys
-bit-reproducibility. The slowdown factor is `ceiling / sum`.
+*Baseline = plain (non-reproducible) `sycl::reduction` of the same data
+type on the same device. It is a comparison point, not a hard performance
+ceiling. A binned deposit performs multiple dependent additions and
+subtractions per fold; the observed gap also includes compiler, backend,
+and runtime effects. The slowdown factor is `baseline / sum`.
 
 > **Note:** The CPU backend uses the SYCL runtime's parallel thread pool
-> (OpenCL CPU runtime), so it benefits from all available cores. The
+> (OpenCL CPU runtime), so it can use the available CPU cores. The
 > higher relative overhead on CPU vs GPU is expected: GPUs hide the
 > deposit dependency chain with massive thread-level parallelism, while
 > CPU threads have fewer opportunities to overlap dependent operations.
@@ -119,27 +127,29 @@ The sum is bit-identical **across CPUs, GPU vendors, and backends**, not
 just across runs. Verified on this machine (single fat binary, device
 code for all targets):
 
-| | NVIDIA RTX PRO 4500 (CUDA) | Intel Meteor Lake iGPU (Level-Zero) | Intel Core Ultra 7 265 CPU (OpenCL) |
+| | NVIDIA RTX PRO 4500 Blackwell (CUDA) | Intel Graphics [0x7d67] (Level-Zero) | Intel Core Ultra 7 265 CPU (OpenCL) |
 |---|---|---|---|
 | `double`, 1M wide-range | `0x430FC878C605717F` | `0x430FC878C605717F` | `0x430FC878C605717F` |
 | shuffled input order | same bits | same bits | same bits |
 
-The test suite enforces this: `ADNSumCrossDevice` sums the same data on
-every available device (CPU + all GPUs) - each seeing a *different* input
-order - and requires bit-identical results. The parameterized correctness
-suite runs every test on every device independently.
+The test suite chooses one backend per distinct device name, preferring
+Level-Zero, then CUDA, then other backends, with OpenCL as the fallback.
+`ADNSumCrossDevice` sums the same data on every selected device - each seeing
+a *different* input order - and requires bit-identical results. The
+parameterized correctness suite runs every test on every selected device.
 
-This makes results portable across heterogeneous clusters, between a
-developer's laptop (CPU-only) and production GPU accelerators, and across
-hardware upgrades - the answer never changes.
+Within the documented capacity, this makes results portable across supported
+devices that pass environment validation, including heterogeneous CPU and GPU
+systems and hardware upgrades.
 
 ## How It Works
 
 Every value is *deposited* into a K-fold **binned accumulator**: K primary
 values aligned to a fixed, global grid of exponent bins (bin width W = 40
-bits for double, 13 bits for float), plus K carry counters. Because every
-deposit rounds on the same absolute grid, the result is independent of
-summation order - no max-scan is needed, so the data is read exactly once:
+bits for double, 13 bits for float), plus K carry counters. Within the
+accumulator capacity, every deposit rounds on the same absolute grid, so the
+result is independent of summation order. No max-scan is needed, and the
+accumulation kernel reads each device input element exactly once:
 
 1. **Deposit** - Each work-item strides over the input and adds each
    element to its private accumulator with a few plain FP additions
@@ -147,11 +157,11 @@ summation order - no max-scan is needed, so the data is read exactly once:
 
 2. **Renormalize** - After every 2^(mantissa_bits - W - 2) deposits, the
    drift of each primary value is shifted into its carry counter, so the
-   accumulator never overflows.
+   accumulator does not overflow within its documented capacity.
 
 3. **Merge** - Work-group accumulators are combined with an exact binned
-   tree reduction; the per-group results are merged on the host and
-   converted back to a single float/double.
+   tree reduction; a final device work-group merges the per-group results
+   and converts the total back to a single float/double.
 
 ```
 Deposit of x (double, W=40, K=3), into an accumulator whose bins cover x:
@@ -166,12 +176,22 @@ or a sum containing both +Inf and -Inf, produces a fixed positive quiet NaN
 input payloads, order, reduction tree, and device conventions. Subnormals
 deposit into the bottom bins; values below the format's absorption threshold
 (~2^-1055 for double / ~2^-144 for float at K=3) round away deterministically,
-per the documented ADN error bound ~N * 2^(-W*(K-1)) * max|x|.
+per the dominant binned error term ~N * 2^(-W*(K-1)) * max|x|. This is an
+absolute error scale; cancellation can make error relative to the exact sum
+much larger.
 
 ## API Reference
 
 ```cpp
 namespace adn {
+
+/// Conservative maximum input count for the binned accumulator.
+template <typename T>
+inline constexpr std::uint64_t max_reproducible_count = /* ... */;
+
+/// Validate the queue's device floating-point environment.
+template <typename T>
+void validate_environment(sycl::queue &q);
 
 /// Reproducible single-pass sum of N values.
 /// Accepts device, shared, host USM, or plain host pointers.
@@ -190,29 +210,74 @@ T sum(sycl::queue &q, const T *arr, size_t N);
 
 | Pointer source | Behavior |
 |----------------|----------|
-| `sycl::malloc_device` | Used directly by kernel (zero-copy) |
-| `sycl::malloc_shared` | Used directly by kernel (zero-copy) |
-| `sycl::malloc_host` | Used directly by kernel (zero-copy) |
-| Plain host pointer (`new`, stack, `std::vector::data()`) | Auto-copied to device memory, freed after computation |
+| `sycl::malloc_device` | Used directly; no library-side copy |
+| `sycl::malloc_shared` | Used directly; no library-side copy |
+| `sycl::malloc_host` | Used directly; no library-side copy |
+| Plain host pointer (`new`, stack, `std::vector::data()`) | Copied into a temporary device allocation; only the temporary is freed |
 
-Detection is done at runtime via `sycl::get_pointer_type`.
+Detection is done at runtime via `sycl::get_pointer_type`. "No library-side
+copy" does not guarantee a physical zero-copy implementation; the SYCL
+runtime may migrate or otherwise manage USM storage.
+
+### Accumulator capacity
+
+The binned carry fields can represent a finite number of summands while
+remaining exact. SyclReproSum uses the conservative capacities from ReproBLAS:
+
+| Type | Maximum reproducible input count |
+|------|---------------------------------:|
+| `float` | 4,294,966,784 |
+| `double` | 9,223,372,036,854,773,760 |
+
+The limit is available to callers as
+`adn::max_reproducible_count<float>` or
+`adn::max_reproducible_count<double>`. `adn::sum` throws
+`std::length_error` before inspecting the pointer or allocating memory when
+`N` exceeds the corresponding limit. Splitting the input and adding the
+scalar chunk results does not preserve the reproducibility guarantee.
 
 ### Template Parameters
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
 | `K` | 3 | 2 to max fold | Fold count (bins held). More = higher accuracy, slower. |
-| `WG_SIZE` | 256 | 2-1024 (power of 2) | Work-group size (threads per group on GPU, SIMD lanes on CPU). |
+| `WG_SIZE` | 256 | 2-1024 (power of 2) | Work-items per work-group; must also fit the target device limits. |
 | `T` | (deduced) | `float` or `double` | Floating-point type. |
 
-| Type | Mantissa bits | Bin width W | Max K | Accuracy at K=3 |
-|------|--------------|-------------|-------|-----------------|
-| `double` | 53 | 40 | 52 | ~2^-80 relative to max abs |
-| `float` | 24 | 13 | 21 | ~2^-26 relative to max abs |
+| Type | Mantissa bits | Bin width W | Max K | Dominant binned error term at K=3 |
+|------|--------------|-------------|-------|-------------------------------------|
+| `double` | 53 | 40 | 52 | ~N * 2^-80 * max abs input |
+| `float` | 24 | 13 | 21 | ~N * 2^-26 * max abs input |
 
 The bin width is fixed (ReproBLAS DBWIDTH/SBWIDTH); each additional fold
-extends coverage by another W bits below the running maximum.
-Invalid parameters trigger a `static_assert` at compile time.
+extends coverage by another W bits below the running maximum. The error term
+above is absolute, not relative to the exact sum. Invalid template parameters
+trigger a `static_assert`; a syntactically valid `WG_SIZE` can still exceed a
+particular device's work-group or local-memory limits at runtime.
+
+### Runtime environment validation
+
+Every non-empty `adn::sum` call automatically validates the floating-point
+environment before inspecting the input pointer or allocating the main work
+buffer. All final merging and conversion runs on the device, so host rounding
+and denormal modes do not affect the result. Validation is fail-closed and
+covers:
+
+- the IEEE binary32 and binary64 layouts used by the bit-level helpers;
+- device fp64 support, including for float sums whose final conversion uses
+  double arithmetic;
+- SYCL round-to-nearest, denormal, and Inf/NaN capability declarations for
+  every precision used;
+- effective device arithmetic using runtime-loaded rounding, subnormal, and
+  signed-zero probes.
+
+A successful device arithmetic check for a root-enumerated device is shared by
+all host threads and cached by backend, device, and floating-point type.
+Dynamically created sub-devices are not in that fixed cache and are validated
+on every use. Applications can optionally preflight a queue explicitly with
+`adn::validate_environment<float>(q)` or
+`adn::validate_environment<double>(q)`. Validation throws `std::runtime_error`
+with the failed prerequisite when the guarantee cannot be established.
 
 ### Compiler safety
 
@@ -222,15 +287,23 @@ NaN, infinity, subnormal, signed-zero, and rounding-order semantics required
 for reproducibility, and their individual assumptions cannot be reliably
 undone inside a header.
 
-With strict floating-point semantics enabled, compiler pragmas additionally
-disable reassociation and FP contraction (FMA) in the accumulator logic.
+With strict floating-point semantics enabled, scoped compiler pragmas disable
+reassociation, reciprocal transformations, and FP contraction (FMA) in the
+accumulator logic. Individual options such as
+`-fdenormal-fp-math=positive-zero` and `-fno-signed-zeros` are not consistently
+exposed by a preprocessor macro, so runtime arithmetic probes verify their
+effective device behavior and reject unsafe combinations.
 
 ## Building
 
 ### Prerequisites
 
-- [Intel DPC++ compiler](https://github.com/intel/llvm) (clang++ with `-fsycl`, C++17 or later)
-- For GPU: NVIDIA GPU + CUDA toolkit (for `nvptx64` target), and/or Intel GPU runtime (for `spir64`)
+- [Intel DPC++ compiler](https://github.com/intel/llvm)
+  (`clang++` with `-fsycl`, C++17 or later)
+- A SYCL device with fp64 support that passes runtime environment validation
+  (required by both float and double sums)
+- For GPU: NVIDIA GPU + CUDA toolkit (for `nvptx64` target), and/or Intel
+  GPU runtime (for `spir64`)
 - For CPU: Intel OpenCL CPU runtime (`intel-oneapi-runtime-opencl`)
 - CMake + g++ (for building Google Test)
 
@@ -260,6 +333,7 @@ make all
 |--------|-------------|
 | `make` / `make example` | Build the usage example (`repro_example`) |
 | `make test` | Build and run Google Test suite |
+| `make test-validation` | Run hostile host/device validation tests |
 | `make all` | Build both example and tests |
 | `make run` | Build and run the example |
 | `make clean` | Remove binaries and build artifacts |
@@ -270,8 +344,9 @@ make all
 Override via environment or command line:
 
 ```bash
-# Custom DPC++ location
-make DPCPP_HOME=/opt/intel/oneapi/compiler/latest
+# Custom DPC++ source/build workspace root. The Makefile appends
+# /llvm/build/bin/clang++ and /llvm/build/lib.
+make DPCPP_HOME=/path/to/sycl_workspace
 
 # Target only NVIDIA GPU
 make SYCL_TARGETS=nvptx64-nvidia-cuda
@@ -279,10 +354,14 @@ make SYCL_TARGETS=nvptx64-nvidia-cuda
 
 ## Test Suite
 
-The Google Test suite is value-parameterized over every device on the
-system (CPUs + GPUs): each correctness case runs once per device from a
-single fat binary (CUDA + SPIR-V), plus cross-device bit-identity tests
-and throughput benchmarks. 437 tests on a system with 2 GPUs + 1 CPU.
+The Google Test suite chooses one preferred backend per distinct device name
+(Level-Zero, then CUDA, then other backends, with OpenCL as the fallback).
+Each correctness case runs once per selected CPU or GPU from a single fat
+binary (CUDA + SPIR-V), plus cross-device bit-identity tests and throughput
+benchmarks. There are 148 correctness cases and 2 benchmarks per device, plus
+7 cross-device cases and one version test: 458 tests on a system with 2 GPUs +
+1 CPU. The `WG_SIZE=1024` cases skip on a device whose work-group or local
+memory limits cannot support that configuration.
 
 | Category | Description |
 |----------|-------------|
@@ -291,13 +370,20 @@ and throughput benchmarks. 437 tests on a system with 2 GPUs + 1 CPU.
 | Cancellation stress | Multi-order cancellation, Kahan worst case, near-overflow cancellation |
 | Large-scale | 1M to 20M elements, multi-work-group boundaries |
 | Special values | Canonical NaN across payloads/devices, Inf propagation, subnormals, overflow to +Inf |
-| Reproducibility | Multi-run bit-identity, shuffle order-independence, cross-WG_SIZE and cross-device (CPU vs CUDA vs Level-Zero) consistency |
-| Configurations | K = 2..12, WG_SIZE = 64..1024, device-pointer and host-pointer APIs |
-| Benchmarks | Throughput measurement on all devices (GPU + CPU) |
+| Reproducibility | Multi-run bit-identity, shuffle order-independence, cross-WG_SIZE and selected cross-device/backend consistency |
+| Environment safety | Host rounding and FTZ/DAZ independence, shared validation across threads, unsafe device mode rejection |
+| Configurations | K = 2, 3, 4, 5, 6, 8, 12; WG_SIZE = 64, 128, 256, 512, 1024; device- and host-pointer APIs |
+| Benchmarks | Throughput measurement on all selected devices (GPU + CPU) |
 
 ```bash
-# Run all tests
+# Run the normal suite, including benchmarks
 make test
+
+# Rebuild and test hostile host/device floating-point modes
+make test-validation
+
+# Run the normal suite and all validation variants
+make test test-validation
 
 # Filter specific tests (e.g. float only)
 LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test --gtest_filter="*Float*"

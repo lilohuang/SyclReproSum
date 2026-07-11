@@ -31,19 +31,23 @@ Enforced by `.clang-format` + CI (`.github/workflows/format.yml`):
 
 ## Layout
 
-- `repro_sum.hpp` - the entire library (public API: `adn::sum`).
-- `repro_test.cpp` - Google Test suite, value-parameterized over all available
-  GPUs and CPUs (141 correctness cases and 2 `ADNSumBench` throughput
-  benchmarks per device), plus 7 cross-device cases and a version test.
+- `repro_sum.hpp` - the entire library (public APIs: `adn::sum` and
+  `adn::validate_environment`).
+- `repro_test.cpp` - Google Test suite, value-parameterized over one preferred
+  backend per distinct GPU or CPU name (148 correctness cases and 2
+  `ADNSumBench` throughput benchmarks per device), plus 7 cross-device cases
+  and a version test.
 - `example.cpp` - minimal runnable usage example.
 - `third_party/googletest` - git submodule; never edit.
 
 ## Building and testing
 
 - Requires Intel DPC++ (`clang++ -fsycl`); set `DPCPP_HOME` if not in
-  `~/sycl_workspace`. At least one supported SYCL CPU or GPU device is required
-  to run the parameterized tests.
+  `~/sycl_workspace`. At least one fp64-capable SYCL CPU or GPU device is
+  required to run the parameterized tests.
 - `make all` builds example + tests; `make test` runs the suite.
+- `make test-validation` rebuilds and runs the correctness suite with hostile
+  host modes, then verifies unsafe device modes are rejected.
 - `make test` includes the 100M-element throughput benchmarks. For a quicker
   correctness-only run, use `./repro_test "--gtest_filter=-*Bench*"`.
 - CI currently checks formatting only; build and device testing are local.

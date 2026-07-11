@@ -13,7 +13,9 @@
 
 #include <gtest/gtest.h>
 #include <sycl/sycl.hpp>
+#include <atomic>
 #include <vector>
+#include <cfenv>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -25,6 +27,12 @@
 #include <random>
 #include <algorithm>
 #include <limits>
+#include <mutex>
+#include <thread>
+
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif
 
 #include "repro_sum.hpp"
 
@@ -63,16 +71,16 @@ static double double_from_bits(std::uint64_t b) {
 }
 
 template <typename T>
-static ::testing::AssertionResult
-assert_bit_equal(const char *a_expr, const char *b_expr, T a, T b) {
+static ::testing::AssertionResult assert_bit_equal(
+   const char *a_expr, const char *b_expr, T a, T b) {
    if (bits_of(a) == bits_of(b)) {
       return ::testing::AssertionSuccess();
    }
    return ::testing::AssertionFailure()
-          << a_expr << " and " << b_expr << " are not bit-identical:\n  "
-          << std::setprecision(17) << a << " (0x" << std::hex << bits_of(a)
-          << ") vs\n  " << std::setprecision(17) << b << " (0x" << std::hex
-          << bits_of(b) << ")";
+      << a_expr << " and " << b_expr << " are not bit-identical:\n  "
+      << std::setprecision(17) << a << " (0x" << std::hex << bits_of(a)
+      << ") vs\n  " << std::setprecision(17) << b << " (0x" << std::hex
+      << bits_of(b) << ")";
 }
 
 #define EXPECT_BIT_EQ(val, ref) EXPECT_PRED_FORMAT2(assert_bit_equal, val, ref)
@@ -82,42 +90,72 @@ assert_bit_equal(const char *a_expr, const char *b_expr, T a, T b) {
 //
 //  All distinct GPUs on the system, deduplicated by name (the same
 //  physical device can be exposed by several backends, e.g. an
-//  Intel iGPU via both Level-Zero and OpenCL).
+//  Intel iGPU via both Level-Zero and OpenCL).  Prefer Level-Zero,
+//  then CUDA, then other backends, with OpenCL as the fallback.
 // ============================================================
 
-static const std::vector<sycl::device> &all_gpus() {
-   static const std::vector<sycl::device> devices = [] {
-      std::vector<sycl::device> result;
-      std::vector<std::string> seen;
-      for (auto &d : sycl::device::get_devices(sycl::info::device_type::gpu)) {
-         std::string key = d.get_info<sycl::info::device::name>();
-         if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
-            seen.push_back(key);
-            result.push_back(d);
+static int backend_rank(sycl::backend backend) {
+   if (backend == sycl::backend::ext_oneapi_level_zero) {
+      return 0;
+   }
+   if (backend == sycl::backend::ext_oneapi_cuda) {
+      return 1;
+   }
+   if (backend == sycl::backend::opencl) {
+      return 3;
+   }
+   return 2;
+}
+
+static std::vector<sycl::device> preferred_devices(
+   sycl::info::device_type type) {
+   std::vector<sycl::device> result;
+   for (const sycl::device &device : sycl::device::get_devices(type)) {
+      const std::string name = device.get_info<sycl::info::device::name>();
+      auto existing = result.end();
+      for (auto candidate = result.begin(); candidate != result.end();
+         ++candidate) {
+         if (candidate->get_info<sycl::info::device::name>() == name) {
+            existing = candidate;
+            break;
          }
       }
-      return result;
-   }();
+
+      if (existing == result.end()) {
+         result.push_back(device);
+      } else if (backend_rank(device.get_platform().get_backend()) <
+         backend_rank(existing->get_platform().get_backend())) {
+         *existing = device;
+      }
+   }
+   return result;
+}
+
+static const std::vector<sycl::device> &all_gpus() {
+   static const std::vector<sycl::device> devices =
+      preferred_devices(sycl::info::device_type::gpu);
    return devices;
+}
+
+static bool has_level_zero_gpu(const std::string &name) {
+   for (const sycl::device &device :
+      sycl::device::get_devices(sycl::info::device_type::gpu)) {
+      if (device.get_info<sycl::info::device::name>() == name &&
+         device.get_platform().get_backend() ==
+            sycl::backend::ext_oneapi_level_zero) {
+         return true;
+      }
+   }
+   return false;
 }
 
 static const std::vector<sycl::device> &all_cpus() {
-   static const std::vector<sycl::device> devices = [] {
-      std::vector<sycl::device> result;
-      std::vector<std::string> seen;
-      for (auto &d : sycl::device::get_devices(sycl::info::device_type::cpu)) {
-         std::string key = d.get_info<sycl::info::device::name>();
-         if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
-            seen.push_back(key);
-            result.push_back(d);
-         }
-      }
-      return result;
-   }();
+   static const std::vector<sycl::device> devices =
+      preferred_devices(sycl::info::device_type::cpu);
    return devices;
 }
 
-/// All devices (GPUs + CPUs), deduplicated by name.
+/// Preferred backend for each distinct GPU and CPU name.
 static const std::vector<sycl::device> &all_devices() {
    static const std::vector<sycl::device> devices = [] {
       std::vector<sycl::device> result;
@@ -137,8 +175,8 @@ static const std::vector<sycl::device> &all_devices() {
 }
 
 /// @brief Sanitize a device name into a valid gtest parameter label.
-static std::string
-device_label(const ::testing::TestParamInfo<sycl::device> &info) {
+static std::string device_label(
+   const ::testing::TestParamInfo<sycl::device> &info) {
    std::string name = info.param.get_info<sycl::info::device::name>();
    for (char &c : name) {
       if (!std::isalnum(static_cast<unsigned char>(c))) {
@@ -149,9 +187,9 @@ device_label(const ::testing::TestParamInfo<sycl::device> &info) {
 }
 
 // ============================================================
-//  Shared fixture, parameterized over every GPU on the system:
-//  each test runs once per device from a single fat binary
-//  (CUDA + SPIR-V device code selected at runtime).
+//  Shared fixture, parameterized over one preferred backend for each
+//  distinct GPU and CPU name.  Each test runs once per selected device
+//  from a single fat binary (CUDA + SPIR-V device code at runtime).
 // ============================================================
 
 class ADNSumTest : public ::testing::TestWithParam<sycl::device> {
@@ -203,11 +241,11 @@ private:
    std::optional<sycl::queue> q_;
 };
 
-INSTANTIATE_TEST_SUITE_P(GPUs, ADNSumTest, ::testing::ValuesIn(all_gpus()),
-                         device_label);
+INSTANTIATE_TEST_SUITE_P(
+   GPUs, ADNSumTest, ::testing::ValuesIn(all_gpus()), device_label);
 
-INSTANTIATE_TEST_SUITE_P(CPUs, ADNSumTest, ::testing::ValuesIn(all_cpus()),
-                         device_label);
+INSTANTIATE_TEST_SUITE_P(
+   CPUs, ADNSumTest, ::testing::ValuesIn(all_cpus()), device_label);
 
 // ============================================================
 //  Double-precision edge cases
@@ -217,6 +255,136 @@ TEST_P(ADNSumTest, EmptyArray) {
    std::vector<double> v;
    EXPECT_EQ(adn::sum(queue(), v.data(), v.size()), 0.0);
 }
+
+TEST_P(ADNSumTest, CapacityExceededRejected) {
+   if constexpr (std::numeric_limits<size_t>::max() >
+      adn::max_reproducible_count<float>) {
+      float value = 1.0f;
+      const size_t too_many =
+         static_cast<size_t>(adn::max_reproducible_count<float> + 1);
+      EXPECT_THROW(adn::sum(queue(), &value, too_many), std::length_error);
+   }
+}
+
+TEST_P(ADNSumTest, DeviceEnvironmentValidated) {
+   const sycl::device &device = queue().get_device();
+   const std::string name = device.get_info<sycl::info::device::name>();
+   if (device.is_gpu() && has_level_zero_gpu(name)) {
+      EXPECT_EQ(queue().get_backend(), sycl::backend::ext_oneapi_level_zero);
+   }
+
+   if (!device.has(sycl::aspect::fp64)) {
+      EXPECT_THROW(
+         adn::validate_environment<float>(queue()), std::runtime_error);
+      EXPECT_THROW(
+         adn::validate_environment<double>(queue()), std::runtime_error);
+      return;
+   }
+
+   EXPECT_NO_THROW(adn::validate_environment<float>(queue()));
+   EXPECT_NO_THROW(adn::validate_environment<double>(queue()));
+}
+
+TEST_P(ADNSumTest, HostRoundingModeIndependent) {
+   if (!queue().get_device().has(sycl::aspect::fp64)) {
+      GTEST_SKIP() << "Device does not support fp64";
+   }
+
+   std::vector<float> values{1e20f, -1e20f, 3.5f, -2.0f, 0.25f};
+   const float reference = adn::sum(queue(), values.data(), values.size());
+
+   const int original_rounding = std::fegetround();
+   ASSERT_NE(original_rounding, -1);
+   ASSERT_EQ(std::fesetround(FE_DOWNWARD), 0);
+
+   EXPECT_NO_THROW(adn::validate_environment<float>(queue()));
+   float downward_result = 0.0f;
+   EXPECT_NO_THROW(
+      downward_result = adn::sum(queue(), values.data(), values.size()));
+
+   EXPECT_EQ(std::fesetround(original_rounding), 0);
+   EXPECT_BIT_EQ(downward_result, reference);
+}
+
+TEST_P(ADNSumTest, HostDenormalModeIndependent) {
+#if defined(__SSE__)
+   if (!queue().get_device().has(sycl::aspect::fp64)) {
+      GTEST_SKIP() << "Device does not support fp64";
+   }
+
+   const double tiny = double_from_bits(UINT64_C(10000000000));
+   std::vector<double> values(10000, tiny);
+   const double reference = adn::sum(queue(), values.data(), values.size());
+
+   const unsigned original_mxcsr = _mm_getcsr();
+   _mm_setcsr(original_mxcsr | (1u << 15) | (1u << 6));
+
+   EXPECT_NO_THROW(adn::validate_environment<double>(queue()));
+   double hostile_result = 0.0;
+   EXPECT_NO_THROW(
+      hostile_result = adn::sum(queue(), values.data(), values.size()));
+
+   _mm_setcsr(original_mxcsr);
+   EXPECT_BIT_EQ(hostile_result, reference);
+#else
+   GTEST_SKIP() << "Host does not expose SSE MXCSR controls";
+#endif
+}
+
+struct ConcurrentDeviceValidationTag {};
+
+TEST_P(ADNSumTest, DeviceValidationSharedAcrossThreads) {
+   if (!queue().get_device().has(sycl::aspect::fp64)) {
+      GTEST_SKIP() << "Device does not support fp64";
+   }
+
+   sycl::queue &q = queue();
+   auto *slot =
+      adn::detail::find_device_validation_slot<ConcurrentDeviceValidationTag>(
+         q.get_backend(), q.get_device());
+   ASSERT_NE(slot, nullptr);
+
+   constexpr int thread_count = 16;
+   std::atomic<bool> start{false};
+   std::atomic<int> probe_runs{0};
+   std::atomic<int> failures{0};
+   std::vector<std::thread> threads;
+   threads.reserve(thread_count);
+
+   for (int i = 0; i < thread_count; ++i) {
+      threads.emplace_back([&] {
+         while (!start.load(std::memory_order_acquire)) {
+         }
+         try {
+            std::call_once(slot->once, [&] {
+               probe_runs.fetch_add(1, std::memory_order_relaxed);
+               adn::detail::validate_device_capabilities<double>(
+                  q.get_device());
+               adn::detail::run_device_environment_probe<double>(q);
+               adn::detail::validate_device_capabilities<float>(q.get_device());
+               adn::detail::run_device_environment_probe<float>(q);
+            });
+         } catch (...) {
+            failures.fetch_add(1, std::memory_order_relaxed);
+         }
+      });
+   }
+
+   start.store(true, std::memory_order_release);
+   for (std::thread &thread : threads) {
+      thread.join();
+   }
+
+   EXPECT_EQ(failures.load(std::memory_order_relaxed), 0);
+   EXPECT_EQ(probe_runs.load(std::memory_order_relaxed), 1);
+}
+
+#if defined(ADN_TEST_EXPECT_DEVICE_REJECTION)
+TEST_P(ADNSumTest, UnsafeDeviceEnvironmentRejected) {
+   EXPECT_THROW(adn::validate_environment<float>(queue()), std::runtime_error);
+   EXPECT_THROW(adn::validate_environment<double>(queue()), std::runtime_error);
+}
+#endif
 
 TEST_P(ADNSumTest, SingleElement) {
    std::vector<double> v{42.0};
@@ -513,8 +681,8 @@ TEST_P(ADNSumTest, Float_AllZeros) {
 
 TEST_P(ADNSumTest, Float_SingleMaxValue) {
    std::vector<float> v{std::numeric_limits<float>::max()};
-   EXPECT_EQ(adn::sum(queue(), v.data(), v.size()),
-             std::numeric_limits<float>::max());
+   EXPECT_EQ(
+      adn::sum(queue(), v.data(), v.size()), std::numeric_limits<float>::max());
 }
 
 TEST_P(ADNSumTest, Float_SingleMinNormal) {
@@ -932,6 +1100,15 @@ TEST_P(ADNSumTest, DevicePointer_LargeArray) {
 //  Custom WG_SIZE configurations
 // ============================================================
 
+template <typename T, int K>
+static bool supports_wg_size_1024(const sycl::device &device) {
+   constexpr size_t wg_size = 1024;
+   constexpr size_t local_bytes = wg_size * sizeof(adn::detail::Binned<T, K>);
+   return device.get_info<sycl::info::device::max_work_group_size>() >=
+      wg_size &&
+      device.get_info<sycl::info::device::local_mem_size>() >= local_bytes;
+}
+
 TEST_P(ADNSumTest, WGSize64_Double) {
    std::vector<double> v(10000, 1.0);
    v[0] = 1e15;
@@ -962,6 +1139,26 @@ TEST_P(ADNSumTest, WGSize512_Double) {
    EXPECT_NEAR(result, 9998.0, 1e-6);
 }
 
+TEST_P(ADNSumTest, WGSize1024_Double) {
+   if (!supports_wg_size_1024<double, 3>(queue().get_device())) {
+      GTEST_SKIP() << "Device resources do not support WG_SIZE=1024";
+   }
+
+   std::mt19937 gen(1024);
+   std::uniform_real_distribution<double> dist(-1e8, 1e8);
+   std::vector<double> v(16387);
+   for (double &x : v) {
+      x = dist(gen);
+   }
+
+   const double reference = adn::sum<3, 256>(queue(), v.data(), v.size());
+   EXPECT_BIT_EQ((adn::sum<3, 1024>(queue(), v.data(), v.size())), reference);
+
+   std::mt19937 shuffle_rng(7);
+   std::shuffle(v.begin(), v.end(), shuffle_rng);
+   EXPECT_BIT_EQ((adn::sum<3, 1024>(queue(), v.data(), v.size())), reference);
+}
+
 TEST_P(ADNSumTest, WGSize64_Float) {
    std::vector<float> v(10000, 1.0f);
    float result = adn::sum<3, 64>(queue(), v.data(), v.size());
@@ -972,6 +1169,26 @@ TEST_P(ADNSumTest, WGSize512_Float) {
    std::vector<float> v(10000, 1.0f);
    float result = adn::sum<3, 512>(queue(), v.data(), v.size());
    EXPECT_EQ(result, 10000.0f);
+}
+
+TEST_P(ADNSumTest, WGSize1024_Float) {
+   if (!supports_wg_size_1024<float, 3>(queue().get_device())) {
+      GTEST_SKIP() << "Device resources do not support WG_SIZE=1024";
+   }
+
+   std::mt19937 gen(1024);
+   std::uniform_real_distribution<float> dist(-1e4f, 1e4f);
+   std::vector<float> v(16387);
+   for (float &x : v) {
+      x = dist(gen);
+   }
+
+   const float reference = adn::sum<3, 256>(queue(), v.data(), v.size());
+   EXPECT_BIT_EQ((adn::sum<3, 1024>(queue(), v.data(), v.size())), reference);
+
+   std::mt19937 shuffle_rng(7);
+   std::shuffle(v.begin(), v.end(), shuffle_rng);
+   EXPECT_BIT_EQ((adn::sum<3, 1024>(queue(), v.data(), v.size())), reference);
 }
 
 // ============================================================
@@ -1058,7 +1275,7 @@ TEST_P(ADNSumTest, Float_NegativeZero) {
 TEST_P(ADNSumTest, Double_SingleMaxValue) {
    std::vector<double> v{std::numeric_limits<double>::max()};
    EXPECT_EQ(adn::sum(queue(), v.data(), v.size()),
-             std::numeric_limits<double>::max());
+      std::numeric_limits<double>::max());
 }
 
 TEST_P(ADNSumTest, Double_TwoMaxOpposite) {
@@ -1071,7 +1288,7 @@ TEST_P(ADNSumTest, Double_TwoMaxOpposite) {
 
 TEST_P(ADNSumTest, Float_TwoMaxOpposite) {
    float mx = std::numeric_limits<float>::max();
-   std::vector<float> v{mx, -mx};
+   std::vector<float> v{mx, static_cast<float>(-mx)};
    float result = adn::sum(queue(), v.data(), v.size());
    EXPECT_FALSE(std::isnan(result));
    EXPECT_EQ(result, 0.0f);
@@ -1274,28 +1491,29 @@ TEST_P(ADNSumTest, SortedDescending_Double) {
 
 TEST_P(ADNSumTest, SubnormalFallback_ManyElements) {
    // Enough subnormals to require multi-work-group reduction
-   double tiny = std::numeric_limits<double>::denorm_min() * 1e10;
+   double tiny = double_from_bits(UINT64_C(10000000000));
    std::vector<double> v(10000, tiny);
    double result = adn::sum(queue(), v.data(), v.size());
    EXPECT_FALSE(std::isnan(result));
    EXPECT_FALSE(std::isinf(result));
-   EXPECT_GT(result, 0.0);
+   EXPECT_NE(bits_of(result), UINT64_C(0));
 }
 
 TEST_P(ADNSumTest, Float_SubnormalFallback_ManyElements) {
-   float tiny = std::numeric_limits<float>::denorm_min() * 1e5f;
+   float tiny = float_from_bits(UINT32_C(100000));
    std::vector<float> v(10000, tiny);
    float result = adn::sum(queue(), v.data(), v.size());
    EXPECT_FALSE(std::isnan(result));
    EXPECT_FALSE(std::isinf(result));
-   EXPECT_GT(result, 0.0f);
+   EXPECT_NE(bits_of(result), UINT32_C(0));
 }
 
 TEST_P(ADNSumTest, OverflowFallback_MultipleMaxValues) {
    // Multiple max-value elements: tests that the overflow fallback
    // handles more than 1 element correctly
    float mx = std::numeric_limits<float>::max();
-   std::vector<float> v{mx, -mx, mx, -mx};
+   std::vector<float> v{
+      mx, static_cast<float>(-mx), mx, static_cast<float>(-mx)};
    float result = adn::sum(queue(), v.data(), v.size());
    EXPECT_FALSE(std::isnan(result));
    EXPECT_EQ(result, 0.0f);
@@ -1535,7 +1753,7 @@ TEST_P(ADNSumTest, MultiWorkGroup_OddCount) {
 }
 
 TEST_P(ADNSumTest, ManyWorkGroups_Reproducible) {
-   // ~400 work-groups: stresses host-side final reduction
+   // ~400 work-groups: stresses the device-side final reduction
    std::mt19937 gen(42);
    std::uniform_real_distribution<double> dist(-1e10, 1e10);
    std::vector<double> v(100000);
@@ -1607,7 +1825,7 @@ TEST_P(ADNSumTest, K5_Reproducible_Random) {
 TEST_P(ADNSumTest, Float_LargestExactInteger) {
    // 2^24 = 16777216 is the largest integer exactly representable in float
    float big_int = 16777216.0f;
-   std::vector<float> v{big_int, big_int, -big_int};
+   std::vector<float> v{big_int, big_int, static_cast<float>(-big_int)};
    EXPECT_EQ(adn::sum(queue(), v.data(), v.size()), big_int);
 }
 
@@ -1714,7 +1932,7 @@ TEST_P(ADNSumTest, InfInput_Propagates) {
 TEST_P(ADNSumTest, NaNInput_Propagates) {
    std::vector<double> v{1.0, std::numeric_limits<double>::quiet_NaN(), 2.0};
    EXPECT_BIT_EQ(adn::sum(queue(), v.data(), v.size()),
-                 double_from_bits(UINT64_C(0x7ff8000000000000)));
+      double_from_bits(UINT64_C(0x7ff8000000000000)));
 }
 
 TEST_P(ADNSumTest, Double_NaNPayloadsCanonicalAndReproducible) {
@@ -1771,7 +1989,7 @@ TEST_P(ADNSumTest, OppositeInfinitiesCanonicalAndReproducible) {
 
 // ============================================================
 //  Regression: float order-independence at large N
-//  (host-side limb merge used to round in float, breaking
+//  (the final limb merge used to round in float, breaking
 //   bit-reproducibility beyond ~256 work-groups)
 // ============================================================
 
@@ -1901,11 +2119,10 @@ protected:
          *d_out = T(0);
          queue()
             .submit([&](sycl::handler &h) {
-               h.parallel_for(
-                  sycl::range<1>(N), sycl::reduction(d_out, sycl::plus<T>()),
-                  [=](sycl::id<1> i, auto &s) { s.combine(d_arr[i]); });
-            })
-            .wait();
+            h.parallel_for(sycl::range<1>(N),
+               sycl::reduction(d_out, sycl::plus<T>()),
+               [=](sycl::id<1> i, auto &s) { s.combine(d_arr[i]); });
+         }).wait();
       });
 
       volatile T sink;
@@ -1927,8 +2144,8 @@ protected:
       RecordProperty("binned_GElemPerSec", r.binned_gelem_s);
       std::printf("  [bench] %s: %-6s N=%zu  naive %7.1f G elements/s | "
                   "adn::sum %7.1f G elements/s (%.1fx slower)\n",
-                  GetParam().get_info<sycl::info::device::name>().c_str(),
-                  type_name, N, r.naive_gelem_s, r.binned_gelem_s, slowdown);
+         GetParam().get_info<sycl::info::device::name>().c_str(), type_name, N,
+         r.naive_gelem_s, r.binned_gelem_s, slowdown);
    }
 };
 
@@ -1940,37 +2157,39 @@ TEST_P(ADNSumBench, Throughput_Float_100M) {
    report<float>("float", 100000000);
 }
 
-INSTANTIATE_TEST_SUITE_P(GPUs, ADNSumBench, ::testing::ValuesIn(all_gpus()),
-                         device_label);
+INSTANTIATE_TEST_SUITE_P(
+   GPUs, ADNSumBench, ::testing::ValuesIn(all_gpus()), device_label);
 
-INSTANTIATE_TEST_SUITE_P(CPUs, ADNSumBench, ::testing::ValuesIn(all_cpus()),
-                         device_label);
+INSTANTIATE_TEST_SUITE_P(
+   CPUs, ADNSumBench, ::testing::ValuesIn(all_cpus()), device_label);
 
 // ============================================================
 //  Version macro sanity
 // ============================================================
 
 TEST(Version, MacroEncoding) {
-   EXPECT_EQ(SYCL_REPRO_SUM_VERSION, SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +
-                                        SYCL_REPRO_SUM_VERSION_MINOR * 100 +
-                                        SYCL_REPRO_SUM_VERSION_PATCH);
+   EXPECT_EQ(SYCL_REPRO_SUM_VERSION,
+      SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +
+         SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH);
    EXPECT_GE(SYCL_REPRO_SUM_VERSION, 10000); // at least 1.0.0
+   EXPECT_EQ(adn::max_reproducible_count<float>, UINT64_C(4294966784));
+   EXPECT_EQ(
+      adn::max_reproducible_count<double>, UINT64_C(9223372036854773760));
 }
 
 // ============================================================
 //  Cross-device / cross-backend bit-identity
 //
 //  The strongest reproducibility guarantee: the same data must
-//  produce a bit-identical sum on every available device (GPUs
-//  across backends, and CPU), even when each device sees the
-//  input in a different order.  Skipped when fewer than two
-//  distinct devices are present.
+//  produce a bit-identical sum on every selected GPU and CPU,
+//  even when each device sees the input in a different order.
+//  Skipped when fewer than two distinct devices are present.
 // ============================================================
 
 class ADNSumCrossDevice : public ::testing::Test {
 protected:
-   /// @brief Sum @p v on every device (shuffling differently per device)
-   ///        and require bit-identical results across all of them.
+   /// @brief Sum @p v on every selected device, shuffle differently per
+   ///        device, and require bit-identical results across all of them.
    template <typename T> static void expect_identical(std::vector<T> v) {
       auto &devices = all_devices();
       if (devices.size() < 2) {

@@ -21,7 +21,7 @@
 int main() {
    sycl::queue q{sycl::gpu_selector_v};
    std::printf("Device: %s\n",
-               q.get_device().get_info<sycl::info::device::name>().c_str());
+      q.get_device().get_info<sycl::info::device::name>().c_str());
 
    // 1e16 +/- pairs cancel exactly; the true sum is the 10000 ones.
    std::vector<double> data;
@@ -42,7 +42,7 @@ int main() {
    std::shuffle(data.begin(), data.end(), rng);
    double shuffled = adn::sum(q, data.data(), data.size());
    std::printf("shuffled input = %.17g (%s)\n", shuffled,
-               shuffled == result ? "bit-identical" : "MISMATCH");
+      shuffled == result ? "bit-identical" : "MISMATCH");
 
    // Device-pointer overload with more folds for higher accuracy:
    double *d_arr = sycl::malloc_device<double>(data.size(), q);

@@ -15,9 +15,10 @@
  * Each scalar is deposited into a K-fold *binned accumulator*: K primary
  * values aligned to a fixed, global grid of exponent bins (bin width
  * W = 40 bits for double, 13 bits for float), plus K carry counters.
- * Because every deposit rounds on the same absolute grid, the result is
- * independent of summation order - bit-reproducible across runs, work-
- * group sizes, and devices - without ever scanning for max|x| first.
+ * Because every deposit rounds on the same absolute grid, sums within the
+ * documented accumulator capacity are independent of summation order -
+ * bit-reproducible across runs, work-group sizes, and devices - without ever
+ * scanning for max|x| first.
  *
  * Compared to a two-pass max-then-split scheme, this needs only ONE pass
  * over the data.  Special values need no fallback path: Inf/NaN propagate
@@ -73,7 +74,7 @@
 #define SYCL_REPRO_SUM_VERSION_PATCH 0
 #define SYCL_REPRO_SUM_VERSION                                                 \
    (SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +                                     \
-    SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH)
+      SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH)
 /// @}
 
 // === Strict IEEE 754 enforcement ==========================================
@@ -87,25 +88,42 @@
 #error "SyclReproSum requires strict IEEE 754 semantics; disable fast-math"
 #endif
 
-// Also prevent contraction and reassociation when the surrounding translation
-// unit otherwise uses strict floating-point semantics.
+#include <sycl/sycl.hpp>
+#include <algorithm>
+#include <cfloat>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <stdexcept>
+#include <type_traits>
+#include <vector>
+
+#if defined(__SYCL_DEVICE_ONLY__)
+static_assert(FLT_EVAL_METHOD == 0,
+   "device floating-point expressions must evaluate in their "
+   "declared type");
+#endif
+
+// Prevent contraction, reassociation, and reciprocal transformations in the
+// arithmetic primitives.  Runtime device probes reject unsafe modes that
+// cannot be overridden by a local pragma.
 #if defined(__clang__) || defined(__INTEL_LLVM_COMPILER)
-#pragma clang fp reassociate(off) contract(off)
+#define SYCL_REPRO_SUM_DETAIL_STRICT_FP                                        \
+   _Pragma("clang fp reassociate(off) reciprocal(off) contract(off)")
 #elif defined(__GNUC__)
 #pragma GCC push_options
 #pragma GCC optimize("no-fast-math")
+#define SYCL_REPRO_SUM_DETAIL_STRICT_FP
 #elif defined(_MSC_VER)
 #pragma float_control(precise, on, push)
 #pragma fp_contract(off)
+#define SYCL_REPRO_SUM_DETAIL_STRICT_FP
+#else
+#define SYCL_REPRO_SUM_DETAIL_STRICT_FP
 #endif
 // ==========================================================================
-
-#include <sycl/sycl.hpp>
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <limits>
-#include <type_traits>
 
 namespace adn {
 
@@ -118,6 +136,36 @@ namespace detail {
  */
 constexpr bool is_power_of_2(int n) {
    return n > 0 && (n & (n - 1)) == 0;
+}
+
+/**
+ * @brief Verify the binary floating-point representation at compile time.
+ */
+template <typename T> constexpr void validate_fp_type() {
+   constexpr bool supported =
+      std::is_same_v<T, float> || std::is_same_v<T, double>;
+   static_assert(supported, "T must be float or double");
+
+   if constexpr (supported) {
+      static_assert(std::numeric_limits<T>::is_iec559,
+         "T must implement IEC 60559 (IEEE 754) semantics");
+      static_assert(
+         std::numeric_limits<T>::radix == 2, "T must use a binary radix");
+      static_assert(std::numeric_limits<T>::has_denorm == std::denorm_present,
+         "T must support gradual underflow");
+
+      if constexpr (std::is_same_v<T, float>) {
+         static_assert(sizeof(T) == 4 && std::numeric_limits<T>::digits == 24 &&
+               std::numeric_limits<T>::min_exponent == -125 &&
+               std::numeric_limits<T>::max_exponent == 128,
+            "float must use the IEEE 754 binary32 format");
+      } else {
+         static_assert(sizeof(T) == 8 && std::numeric_limits<T>::digits == 53 &&
+               std::numeric_limits<T>::min_exponent == -1021 &&
+               std::numeric_limits<T>::max_exponent == 1024,
+            "double must use the IEEE 754 binary64 format");
+      }
+   }
 }
 
 /**
@@ -150,6 +198,10 @@ template <typename T> struct fp {
    /// Deposits allowed between renormalizations (*ENDURANCE).
    static constexpr int endurance = 1 << (mant_dig - bin_width - 2);
 
+   /// Maximum supported summand count (ReproBLAS *CAPACITY).
+   static constexpr std::uint64_t capacity = std::uint64_t(endurance) *
+      ((std::uint64_t(1) << (mant_dig - 1)) - std::uint64_t(1));
+
    /// Scale-down factor for deposits into bin 0 (*COMPRESSION).
    static constexpr T compression =
       T(1.0 / (bits_t(1) << (mant_dig - bin_width + 1)));
@@ -171,8 +223,8 @@ template <typename T> inline T from_bits(typename fp<T>::bits_t b) {
 
 /// @return The biased exponent field of @p x (0 for zero/subnormal).
 template <typename T> inline int exp_field(T x) {
-   return static_cast<int>((to_bits(x) >> (fp<T>::mant_dig - 1)) &
-                           (2u * fp<T>::max_exp - 1));
+   return static_cast<int>(
+      (to_bits(x) >> (fp<T>::mant_dig - 1)) & (2u * fp<T>::max_exp - 1));
 }
 
 /// @return true if @p x is NaN or +/-Inf.
@@ -240,12 +292,11 @@ template <typename T> inline T bin_value(int index) {
    if (index > fp<T>::max_index) {
       index = fp<T>::max_index;
    }
-   const int q = (index == 0)
-                    ? fp<T>::max_exp
-                    : fp<T>::max_exp + fp<T>::mant_dig - fp<T>::bin_width + 1 -
-                         index * fp<T>::bin_width;
+   const int q = (index == 0) ? fp<T>::max_exp
+                              : fp<T>::max_exp + fp<T>::mant_dig -
+         fp<T>::bin_width + 1 - index * fp<T>::bin_width;
    const B b = (B(q + fp<T>::exp_bias) << (fp<T>::mant_dig - 1)) |
-               (B(1) << (fp<T>::mant_dig - 2));
+      (B(1) << (fp<T>::mant_dig - 2));
    return from_bits<T>(b);
 }
 
@@ -257,6 +308,7 @@ template <typename T> inline T bin_value(int index) {
  * with an exact power-of-two multiply before the exponent is read.
  */
 template <typename T> inline int scalar_index(T x) {
+   SYCL_REPRO_SUM_DETAIL_STRICT_FP
    int e = exp_field(x);
    if (e == 0) {
       if (x == T(0)) {
@@ -282,10 +334,9 @@ template <typename T, int K> struct Binned {
 
 /// Bin index the accumulator currently holds (ReproBLAS binned_dmindex).
 template <typename T, int K> inline int accum_index(const Binned<T, K> &a) {
-   return ((fp<T>::max_exp + fp<T>::mant_dig - fp<T>::bin_width + 1 +
-            fp<T>::exp_bias) -
-           exp_field(a.pri[0])) /
-          fp<T>::bin_width;
+   const int top_exp =
+      fp<T>::max_exp + fp<T>::mant_dig - fp<T>::bin_width + 1 + fp<T>::exp_bias;
+   return (top_exp - exp_field(a.pri[0])) / fp<T>::bin_width;
 }
 
 /// @return true if the accumulator's index is 0 (ReproBLAS binned_dmindex0).
@@ -337,6 +388,7 @@ template <typename T, int K> inline void update(Binned<T, K> &a, T x) {
  * regardless of accumulation order.
  */
 template <typename T, int K> inline void deposit(Binned<T, K> &a, T x) {
+   SYCL_REPRO_SUM_DETAIL_STRICT_FP
    if (is_nan_inf(x) || is_nan_inf(a.pri[0])) {
       a.pri[0] = combine_special(a.pri[0], x);
       return;
@@ -384,6 +436,7 @@ template <typename T, int K> inline void deposit(Binned<T, K> &a, T x) {
  * another @ref endurance deposits can be absorbed.
  */
 template <typename T, int K> inline void renorm(Binned<T, K> &a) {
+   SYCL_REPRO_SUM_DETAIL_STRICT_FP
    using B = typename fp<T>::bits_t;
    if (a.pri[0] == T(0) || is_nan_inf(a.pri[0])) {
       return;
@@ -401,11 +454,13 @@ template <typename T, int K> inline void renorm(Binned<T, K> &a) {
 /**
  * @brief Merge two binned accumulators: y += x (ReproBLAS binned_dmdmadd).
  *
- * Exact and order-independent; used for the work-group tree reduction and
- * the final host-side merge.  Both operands must be renormalized.
+ * Exact and order-independent while the total summand count is within the
+ * accumulator capacity; used for both device tree-reduction stages.  Both
+ * operands must be renormalized.
  */
 template <typename T, int K>
 inline void merge(Binned<T, K> &y, const Binned<T, K> &x) {
+   SYCL_REPRO_SUM_DETAIL_STRICT_FP
    if (x.pri[0] == T(0)) {
       return;
    }
@@ -446,13 +501,14 @@ inline void merge(Binned<T, K> &y, const Binned<T, K> &x) {
 
 /**
  * @brief Convert a binned accumulator to its floating-point value
- *        (ReproBLAS binned_ddmconv / binned_ssmconv).  Host-only.
+ *        (ReproBLAS binned_ddmconv / binned_ssmconv).
  *
  * Terms are summed in decreasing exponent order.  The double flavour
  * rescales near-overflow indices; the float flavour accumulates in
  * double, which provides the necessary headroom directly.
  */
 template <typename T, int K> inline T conv(const Binned<T, K> &a) {
+   SYCL_REPRO_SUM_DETAIL_STRICT_FP
    if (is_nan_inf(a.pri[0])) {
       return a.pri[0];
    }
@@ -467,10 +523,10 @@ template <typename T, int K> inline T conv(const Binned<T, K> &a) {
       int i;
       if (xi == 0) {
          Y += double(a.car[0]) * (double(bin_value<float>(0)) / 6.0) *
-              double(fp<float>::expansion);
+            double(fp<float>::expansion);
          Y += double(a.car[1]) * (double(bin_value<float>(1)) / 6.0);
          Y += double(a.pri[0] - bin_value<float>(0)) *
-              double(fp<float>::expansion);
+            double(fp<float>::expansion);
          i = 2;
       } else {
          Y += double(a.car[0]) * (double(bin_value<float>(xi)) / 6.0);
@@ -490,15 +546,21 @@ template <typename T, int K> inline T conv(const Binned<T, K> &a) {
       if (xi <= (3 * mant) / bw) {
          // Indices near overflow: accumulate scaled down by 2^-(2m-W),
          // then scale back up (may correctly produce +/-Inf).
-         const double scale_down = std::ldexp(0.5, 1 - (2 * mant - bw));
-         const double scale_up = std::ldexp(0.5, 1 + (2 * mant - bw));
+         using B = typename fp<double>::bits_t;
+         constexpr int scale_exp = 2 * mant - bw;
+         constexpr int ieee_bias = fp<double>::max_exp - 1;
+         const double scale_down = from_bits<double>(
+            B(ieee_bias - scale_exp) << (fp<double>::mant_dig - 1));
+         const double scale_up = from_bits<double>(
+            B(ieee_bias + scale_exp) << (fp<double>::mant_dig - 1));
          const int scaled = std::max(std::min(K, (3 * mant) / bw - xi), 0);
          if (xi == 0) {
-            Y += a.car[0] * ((bin_value<double>(0) / 6.0) * scale_down *
-                             fp<double>::expansion);
+            Y += a.car[0] *
+               ((bin_value<double>(0) / 6.0) * scale_down *
+                  fp<double>::expansion);
             Y += a.car[1] * ((bin_value<double>(1) / 6.0) * scale_down);
             Y += (a.pri[0] - bin_value<double>(0)) * scale_down *
-                 fp<double>::expansion;
+               fp<double>::expansion;
             i = 2;
          } else {
             Y += a.car[0] * ((bin_value<double>(xi) / 6.0) * scale_down);
@@ -512,7 +574,7 @@ template <typename T, int K> inline T conv(const Binned<T, K> &a) {
             Y += (a.pri[K - 1] - bin_value<double>(xi + K - 1)) * scale_down;
             return Y * scale_up;
          }
-         if (std::isinf(Y * scale_up)) {
+         if (is_inf(Y * scale_up)) {
             return Y * scale_up;
          }
          Y *= scale_up;
@@ -546,8 +608,8 @@ template <typename T, int K> inline T conv(const Binned<T, K> &a) {
  * initialize the empty accumulator.
  */
 template <typename T, int K>
-inline void accumulate(Binned<T, K> &acc, int &e_threshold, int &since_renorm,
-                       T x) {
+inline void accumulate(
+   Binned<T, K> &acc, int &e_threshold, int &since_renorm, T x) {
    if (exp_field(x) > e_threshold) {
       renorm(acc);
       update(acc, x);
@@ -563,14 +625,14 @@ inline void accumulate(Binned<T, K> &acc, int &e_threshold, int &since_renorm,
 }
 
 /**
- * @brief Single-pass reproducible sum kernel + host-side final merge.
+ * @brief Single-pass input kernel plus device-side final reduction.
  *
  * A fixed grid of work-items strides over the input.  Each work-item
  * keeps a private binned accumulator in registers and deposits each
  * element via @ref accumulate (rebinning is division-free thanks to
  * threshold caching).  Work-group accumulators are combined with an
- * exact binned tree reduction, and the per-group results are merged on
- * the host and converted to T.
+ * exact binned tree reduction.  A final device work-group merges the
+ * per-group results and converts the total to T.
  *
  * @tparam T       Floating-point type.
  * @tparam K       Fold count.
@@ -582,6 +644,7 @@ inline void accumulate(Binned<T, K> &acc, int &e_threshold, int &since_renorm,
  */
 template <typename T, int K, int WG_SIZE>
 T sum_impl(sycl::queue &q, const T *d_arr, size_t N) {
+   SYCL_REPRO_SUM_DETAIL_STRICT_FP
    using Acc = Binned<T, K>;
 
    constexpr size_t MAX_GROUPS = 2048;
@@ -591,52 +654,319 @@ T sum_impl(sycl::queue &q, const T *d_arr, size_t N) {
 
    Acc *d_partial = sycl::malloc_shared<Acc>(num_groups, q);
 
-   q.submit([&](sycl::handler &h) {
-       sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
+   sycl::event partials_ready = q.submit([&](sycl::handler &h) {
+      sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
 
-       h.parallel_for(
-          sycl::nd_range<1>(num_groups * WG_SIZE, WG_SIZE),
-          [=](sycl::nd_item<1> item) {
-             const size_t stride = num_groups * WG_SIZE;
-             const int lid = item.get_local_id(0);
+      auto accumulate_partial = [=](sycl::nd_item<1> item) {
+         const size_t stride = num_groups * WG_SIZE;
+         const int lid = item.get_local_id(0);
 
-             Acc acc{};
-             int e_threshold = -1;
-             int since_renorm = 0;
-             for (size_t i = item.get_global_id(0); i < N; i += stride) {
-                accumulate(acc, e_threshold, since_renorm, d_arr[i]);
-             }
-             renorm(acc);
+         Acc acc{};
+         int e_threshold = -1;
+         int since_renorm = 0;
+         for (size_t i = item.get_global_id(0); i < N; i += stride) {
+            accumulate(acc, e_threshold, since_renorm, d_arr[i]);
+         }
+         renorm(acc);
 
-             loc[lid] = acc;
-             sycl::group_barrier(item.get_group());
+         loc[lid] = acc;
+         sycl::group_barrier(item.get_group());
 
-             for (int s = WG_SIZE / 2; s > 0; s >>= 1) {
-                if (lid < s) {
-                   Acc lhs = loc[lid];
-                   merge(lhs, loc[lid + s]);
-                   loc[lid] = lhs;
-                }
-                sycl::group_barrier(item.get_group());
-             }
+         for (int s = WG_SIZE / 2; s > 0; s >>= 1) {
+            if (lid < s) {
+               Acc lhs = loc[lid];
+               merge(lhs, loc[lid + s]);
+               loc[lid] = lhs;
+            }
+            sycl::group_barrier(item.get_group());
+         }
 
-             if (lid == 0) {
-                d_partial[item.get_group(0)] = loc[0];
-             }
-          });
-    }).wait();
+         if (lid == 0) {
+            if (num_groups == 1) {
+               d_partial[0].pri[0] = conv(loc[0]);
+            } else {
+               d_partial[item.get_group(0)] = loc[0];
+            }
+         }
+      };
 
-   Acc total{};
-   for (size_t g = 0; g < num_groups; ++g) {
-      merge(total, d_partial[g]);
+      h.parallel_for(
+         sycl::nd_range<1>(num_groups * WG_SIZE, WG_SIZE), accumulate_partial);
+   });
+
+   if (num_groups > 1) {
+      sycl::event result_ready = q.submit([&](sycl::handler &h) {
+         h.depends_on(partials_ready);
+         sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
+
+         auto finalize = [=](sycl::nd_item<1> item) {
+            const int lid = item.get_local_id(0);
+            Acc acc{};
+            for (size_t g = lid; g < num_groups; g += WG_SIZE) {
+               merge(acc, d_partial[g]);
+            }
+
+            loc[lid] = acc;
+            sycl::group_barrier(item.get_group());
+
+            for (int s = WG_SIZE / 2; s > 0; s >>= 1) {
+               if (lid < s) {
+                  Acc lhs = loc[lid];
+                  merge(lhs, loc[lid + s]);
+                  loc[lid] = lhs;
+               }
+               sycl::group_barrier(item.get_group());
+            }
+
+            if (lid == 0) {
+               d_partial[0].pri[0] = conv(loc[0]);
+            }
+         };
+
+         h.parallel_for(sycl::nd_range<1>(WG_SIZE, WG_SIZE), finalize);
+      });
+      result_ready.wait_and_throw();
+   } else {
+      partials_ready.wait_and_throw();
    }
 
-   const T result = conv(total);
+   const T result = from_bits<T>(to_bits(d_partial[0].pri[0]));
    sycl::free(d_partial, q);
    return result;
 }
 
+/**
+ * @brief Runtime values and results for the device floating-point probe.
+ */
+template <typename T> struct EnvironmentProbeData {
+   T min_normal;
+   T half;
+   T denorm_min;
+   T two;
+   T one;
+   T epsilon;
+   T quarter;
+   T three_quarters;
+   T negative_zero;
+   T compiled_half_min_normal;
+   T half_min_normal;
+   T twice_denorm_min;
+   T below_half_ulp;
+   T above_half_ulp;
+   T preserved_negative_zero;
+   T negative_zero_plus_zero;
+};
+
+template <typename T> class EnvironmentProbeKernel;
+
+inline bool has_fp_config(const std::vector<sycl::info::fp_config> &config,
+   sycl::info::fp_config value) {
+   return std::find(config.begin(), config.end(), value) != config.end();
+}
+
+/**
+ * @brief Check the floating-point capabilities advertised by a SYCL device.
+ */
+template <typename T>
+inline void validate_device_capabilities(const sycl::device &device) {
+   if constexpr (std::is_same_v<T, double>) {
+      if (!device.has(sycl::aspect::fp64)) {
+         throw std::runtime_error(
+            "adn::validate_environment: device lacks fp64 support");
+      }
+   }
+
+   std::vector<sycl::info::fp_config> config;
+   if constexpr (std::is_same_v<T, float>) {
+      config = device.get_info<sycl::info::device::single_fp_config>();
+   } else {
+      config = device.get_info<sycl::info::device::double_fp_config>();
+   }
+
+   if (!has_fp_config(config, sycl::info::fp_config::round_to_nearest)) {
+      throw std::runtime_error(
+         "adn::validate_environment: device does not report "
+         "round-to-nearest support");
+   }
+   if (!has_fp_config(config, sycl::info::fp_config::denorm)) {
+      throw std::runtime_error(
+         "adn::validate_environment: device does not report denormal "
+         "support");
+   }
+   if (!has_fp_config(config, sycl::info::fp_config::inf_nan)) {
+      throw std::runtime_error(
+         "adn::validate_environment: device does not report Inf/NaN "
+         "support");
+   }
+}
+
+/**
+ * @brief Run arithmetic on the device to verify its effective FP semantics.
+ */
+template <typename T> inline void run_device_environment_probe(sycl::queue &q) {
+   SYCL_REPRO_SUM_DETAIL_STRICT_FP
+   using B = typename fp<T>::bits_t;
+   constexpr B half_min_normal_bits = B(1) << (fp<T>::mant_dig - 2);
+   constexpr B negative_zero_bits = B(1) << (sizeof(T) * 8 - 1);
+
+   EnvironmentProbeData<T> *probe =
+      sycl::malloc_shared<EnvironmentProbeData<T>>(1, q);
+   if (probe == nullptr) {
+      throw std::bad_alloc();
+   }
+
+   probe->min_normal = std::numeric_limits<T>::min();
+   probe->half = T(0.5);
+   probe->denorm_min = std::numeric_limits<T>::denorm_min();
+   probe->two = T(2);
+   probe->one = T(1);
+   probe->epsilon = std::numeric_limits<T>::epsilon();
+   probe->quarter = T(0.25);
+   probe->three_quarters = T(0.75);
+   probe->negative_zero = from_bits<T>(negative_zero_bits);
+
+   try {
+      q.submit([=](sycl::handler &h) {
+         h.single_task<EnvironmentProbeKernel<T>>([=]() {
+            probe->compiled_half_min_normal =
+               std::numeric_limits<T>::min() * T(0.5);
+            probe->half_min_normal = probe->min_normal * probe->half;
+            probe->twice_denorm_min = probe->denorm_min * probe->two;
+            probe->below_half_ulp =
+               probe->one + probe->epsilon * probe->quarter;
+            probe->above_half_ulp =
+               probe->one + probe->epsilon * probe->three_quarters;
+            probe->preserved_negative_zero = probe->negative_zero * probe->one;
+            probe->negative_zero_plus_zero = probe->negative_zero + T(0);
+         });
+      }).wait_and_throw();
+   } catch (...) {
+      sycl::free(probe, q);
+      throw;
+   }
+
+   const bool gradual_underflow =
+      to_bits(probe->compiled_half_min_normal) == half_min_normal_bits &&
+      to_bits(probe->half_min_normal) == half_min_normal_bits &&
+      to_bits(probe->twice_denorm_min) == B(2);
+   const bool round_to_nearest =
+      to_bits(probe->below_half_ulp) == to_bits(T(1)) &&
+      to_bits(probe->above_half_ulp) == to_bits(T(1)) + B(1);
+   const bool signed_zero =
+      to_bits(probe->preserved_negative_zero) == negative_zero_bits &&
+      to_bits(probe->negative_zero_plus_zero) == B(0);
+   sycl::free(probe, q);
+
+   if (!gradual_underflow) {
+      throw std::runtime_error(
+         "adn::validate_environment: device lacks gradual underflow");
+   }
+   if (!round_to_nearest) {
+      throw std::runtime_error(
+         "adn::validate_environment: device arithmetic is not "
+         "round-to-nearest");
+   }
+   if (!signed_zero) {
+      throw std::runtime_error(
+         "adn::validate_environment: device does not preserve signed zero");
+   }
+}
+
+template <typename T> struct DeviceValidationSlot {
+   sycl::backend backend;
+   sycl::device device;
+   std::once_flag once;
+
+   DeviceValidationSlot(
+      sycl::backend backend_value, const sycl::device &device_value)
+      : backend(backend_value), device(device_value) {}
+};
+
+template <typename T>
+inline const std::vector<std::unique_ptr<DeviceValidationSlot<T>>> &
+device_validation_slots() {
+   static const auto slots = [] {
+      std::vector<std::unique_ptr<DeviceValidationSlot<T>>> result;
+      for (const sycl::platform &platform : sycl::platform::get_platforms()) {
+         const sycl::backend backend = platform.get_backend();
+         for (const sycl::device &device : platform.get_devices()) {
+            result.push_back(
+               std::make_unique<DeviceValidationSlot<T>>(backend, device));
+         }
+      }
+      return result;
+   }();
+   return slots;
+}
+
+template <typename T>
+inline DeviceValidationSlot<T> *find_device_validation_slot(
+   sycl::backend backend, const sycl::device &device) {
+   for (const auto &slot : device_validation_slots<T>()) {
+      if (slot->backend == backend && slot->device == device) {
+         return slot.get();
+      }
+   }
+   return nullptr;
+}
+
+/**
+ * @brief Validate and cache one backend/device/type combination.
+ */
+template <typename T> inline void validate_device_environment(sycl::queue &q) {
+   const sycl::backend backend = q.get_backend();
+   const sycl::device device = q.get_device();
+   DeviceValidationSlot<T> *slot =
+      find_device_validation_slot<T>(backend, device);
+   auto validate = [&] {
+      validate_device_capabilities<T>(device);
+      run_device_environment_probe<T>(q);
+   };
+
+   if (slot == nullptr) {
+      // Dynamically created sub-devices are not part of root enumeration.
+      // Validate them on every use rather than caching them unsafely.
+      validate();
+      return;
+   }
+   std::call_once(slot->once, validate);
+}
+
 } // namespace detail
+
+/**
+ * @brief Maximum input count supported by the reproducible accumulator.
+ *
+ * Exceeding this conservative ReproBLAS capacity can make carry additions
+ * inexact and therefore order-dependent.
+ *
+ * @tparam T Floating-point type (`float` or `double`).
+ */
+template <typename T>
+inline constexpr std::uint64_t max_reproducible_count = [] {
+   static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
+      "T must be float or double");
+   return detail::fp<T>::capacity;
+}();
+
+/**
+ * @brief Validate the device floating-point environment.
+ *
+ * A successful check is shared by all host threads and cached per backend,
+ * device, and floating-point type.  Float sums also validate double precision
+ * because their final conversion accumulates in double on the device.
+ *
+ * @tparam T Floating-point type (`float` or `double`).
+ * @param q  SYCL queue bound to the target device.
+ * @throws std::runtime_error if the required IEEE 754 semantics are absent.
+ */
+template <typename T> void validate_environment(sycl::queue &q) {
+   detail::validate_fp_type<T>();
+   detail::validate_device_environment<double>(q);
+   if constexpr (std::is_same_v<T, float>) {
+      detail::validate_device_environment<float>(q);
+   }
+}
 
 /**
  * @brief Compile-time validation of the template parameters.
@@ -650,24 +980,24 @@ T sum_impl(sycl::queue &q, const T *d_arr, size_t N) {
  * @tparam WG_SIZE Work-group size.  Must be a power of 2 in [2, 1024].
  */
 template <typename T, int K, int WG_SIZE> constexpr void validate_params() {
-   static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
-                 "T must be float or double");
+   detail::validate_fp_type<T>();
    static_assert(
       K >= 2, "K must be >= 2 (at least 2 folds needed for binned summation)");
    static_assert(K <= detail::fp<T>::max_fold,
-                 "K exceeds the binned format's maximum fold for this type");
+      "K exceeds the binned format's maximum fold for this type");
    static_assert(detail::is_power_of_2(WG_SIZE),
-                 "WG_SIZE must be a power of 2 (required by tree reduction)");
-   static_assert(WG_SIZE >= 2 && WG_SIZE <= 1024,
-                 "WG_SIZE must be between 2 and 1024");
+      "WG_SIZE must be a power of 2 (required by tree reduction)");
+   static_assert(
+      WG_SIZE >= 2 && WG_SIZE <= 1024, "WG_SIZE must be between 2 and 1024");
 }
 
 /**
  * @brief Compute a bit-reproducible sum of N floating-point values in
  *        device memory, in a single pass.
  *
- * The result is independent of work-item execution order, work-group
- * size, and device, making it deterministic across runs and GPUs.
+ * For @p N within @ref max_reproducible_count, the result is independent of
+ * work-item execution order, work-group size, and device, making it
+ * deterministic across runs and GPUs.
  *
  * @tparam K       Fold count (default 3).  More folds = higher accuracy.
  * @tparam WG_SIZE Work-group size (default 256).
@@ -677,7 +1007,14 @@ template <typename T, int K, int WG_SIZE> constexpr void validate_params() {
  *                 host USM, or plain host pointers.  Plain host pointers
  *                 are automatically copied to device memory.
  * @param  N       Number of elements.
- * @return         Bit-reproducible sum regardless of execution order.
+ * @return         Bit-reproducible sum regardless of execution order within
+ *                 the documented accumulator capacity.
+ * @throws std::length_error if @p N exceeds @ref max_reproducible_count.
+ * @throws std::runtime_error if the device lacks the required IEEE 754
+ *                             floating-point semantics.
+ *
+ * @note Both float and double sums require device fp64 support because the
+ *       final float conversion accumulates in double precision.
  *
  * @note NaN inputs and sums containing both +Inf and -Inf return a fixed
  *       positive quiet NaN (0x7fc00000 for float, 0x7ff8000000000000 for
@@ -693,6 +1030,11 @@ T sum(sycl::queue &q, const T *arr, size_t N) {
    if (N == 0) {
       return T(0);
    }
+   if (N > max_reproducible_count<T>) {
+      throw std::length_error(
+         "adn::sum input count exceeds max_reproducible_count<T>");
+   }
+   validate_environment<T>(q);
 
    // If the pointer was allocated by SYCL (device/shared/host USM),
    // use it directly.  Otherwise it is a plain host pointer: allocate
@@ -719,3 +1061,5 @@ T sum(sycl::queue &q, const T *arr, size_t N) {
 #elif defined(_MSC_VER)
 #pragma float_control(pop)
 #endif
+
+#undef SYCL_REPRO_SUM_DETAIL_STRICT_FP
