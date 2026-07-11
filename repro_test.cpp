@@ -378,6 +378,33 @@ TEST_P(ADNSumTest, DeviceValidationSharedAcrossThreads) {
    EXPECT_EQ(probe_runs.load(std::memory_order_relaxed), 1);
 }
 
+TEST_P(ADNSumTest, USMRAIIWaitsAndReleasesOnException) {
+   sycl::queue &q = queue();
+   auto marker_owner = adn::detail::allocate_shared_usm<int>(1, q);
+   int *marker = marker_owner.get();
+   *marker = 0;
+
+   int *released = nullptr;
+   EXPECT_THROW(([&] {
+      auto allocation = adn::detail::allocate_shared_usm<int>(1, q);
+      released = allocation.get();
+      sycl::event pending = q.submit([=](sycl::handler &h) {
+         h.single_task([=] {
+            released[0] = 7;
+            marker[0] = 1;
+         });
+      });
+      adn::detail::submit_or_wait_on_error(pending, []() -> sycl::event {
+         throw std::runtime_error("injected submission failure");
+      });
+   }()),
+      std::runtime_error);
+
+   EXPECT_EQ(*marker, 1);
+   EXPECT_EQ(sycl::get_pointer_type(released, q.get_context()),
+      sycl::usm::alloc::unknown);
+}
+
 #if defined(ADN_TEST_EXPECT_DEVICE_REJECTION)
 TEST_P(ADNSumTest, UnsafeDeviceEnvironmentRejected) {
    EXPECT_THROW(adn::validate_environment<float>(queue()), std::runtime_error);

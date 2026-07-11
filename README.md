@@ -358,8 +358,8 @@ The Google Test suite chooses one preferred backend per distinct device name
 (Level-Zero, then CUDA, then other backends, with OpenCL as the fallback).
 Each correctness case runs once per selected CPU or GPU from a single fat
 binary (CUDA + SPIR-V), plus cross-device bit-identity tests and throughput
-benchmarks. There are 148 correctness cases and 2 benchmarks per device, plus
-7 cross-device cases and one version test: 458 tests on a system with 2 GPUs +
+benchmarks. There are 149 correctness cases and 2 benchmarks per device, plus
+7 cross-device cases and one version test: 461 tests on a system with 2 GPUs +
 1 CPU. The `WG_SIZE=1024` cases skip on a device whose work-group or local
 memory limits cannot support that configuration.
 
@@ -371,7 +371,7 @@ memory limits cannot support that configuration.
 | Large-scale | 1M to 20M elements, multi-work-group boundaries |
 | Special values | Canonical NaN across payloads/devices, Inf propagation, subnormals, overflow to +Inf |
 | Reproducibility | Multi-run bit-identity, shuffle order-independence, cross-WG_SIZE and selected cross-device/backend consistency |
-| Environment safety | Host rounding and FTZ/DAZ independence, shared validation across threads, unsafe device mode rejection |
+| Environment safety | Host FP-mode independence, shared validation, exception-safe USM cleanup, unsafe device mode rejection |
 | Configurations | K = 2, 3, 4, 5, 6, 8, 12; WG_SIZE = 64, 128, 256, 512, 1024; device- and host-pointer APIs |
 | Benchmarks | Throughput measurement on all selected devices (GPU + CPU) |
 

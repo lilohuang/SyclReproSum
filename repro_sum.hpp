@@ -169,6 +169,54 @@ template <typename T> constexpr void validate_fp_type() {
 }
 
 /**
+ * @brief No-throw deleter for a USM allocation owned by a context.
+ */
+template <typename T> struct UsmDeleter {
+   sycl::context context;
+
+   void operator()(T *ptr) const noexcept {
+      if (ptr == nullptr) {
+         return;
+      }
+      try {
+         sycl::free(ptr, context);
+      } catch (...) {
+         // Destructors must not throw while another exception is active.
+      }
+   }
+};
+
+template <typename T> using UsmUniquePtr = std::unique_ptr<T, UsmDeleter<T>>;
+
+/**
+ * @brief Allocate shared USM and immediately transfer it to an RAII owner.
+ */
+template <typename T>
+inline UsmUniquePtr<T> allocate_shared_usm(size_t count, sycl::queue &q) {
+   UsmUniquePtr<T> owner(nullptr, UsmDeleter<T>{q.get_context()});
+   T *ptr = sycl::malloc_shared<T>(count, q);
+   if (ptr == nullptr) {
+      throw std::bad_alloc();
+   }
+   owner.reset(ptr);
+   return owner;
+}
+
+/**
+ * @brief Allocate device USM and immediately transfer it to an RAII owner.
+ */
+template <typename T>
+inline UsmUniquePtr<T> allocate_device_usm(size_t count, sycl::queue &q) {
+   UsmUniquePtr<T> owner(nullptr, UsmDeleter<T>{q.get_context()});
+   T *ptr = sycl::malloc_device<T>(count, q);
+   if (ptr == nullptr) {
+      throw std::bad_alloc();
+   }
+   owner.reset(ptr);
+   return owner;
+}
+
+/**
  * @brief IEEE-754 layout traits and ADN bin parameters per type.
  *
  * Everything is derived from std::numeric_limits except bin_width,
@@ -625,6 +673,23 @@ inline void accumulate(
 }
 
 /**
+ * @brief Submit follow-up work, waiting for pending work if submission fails.
+ *
+ * Waiting preserves the USM deallocation precondition during stack unwinding:
+ * no queued or in-progress command may still use the allocation.
+ */
+template <typename Submit>
+inline sycl::event submit_or_wait_on_error(
+   sycl::event &pending, Submit &&submit) {
+   try {
+      return submit();
+   } catch (...) {
+      pending.wait();
+      throw;
+   }
+}
+
+/**
  * @brief Single-pass input kernel plus device-side final reduction.
  *
  * A fixed grid of work-items strides over the input.  Each work-item
@@ -652,7 +717,8 @@ T sum_impl(sycl::queue &q, const T *d_arr, size_t N) {
    const size_t num_groups =
       groups_needed < MAX_GROUPS ? groups_needed : MAX_GROUPS;
 
-   Acc *d_partial = sycl::malloc_shared<Acc>(num_groups, q);
+   auto partial_owner = allocate_shared_usm<Acc>(num_groups, q);
+   Acc *d_partial = partial_owner.get();
 
    sycl::event partials_ready = q.submit([&](sycl::handler &h) {
       sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
@@ -695,35 +761,37 @@ T sum_impl(sycl::queue &q, const T *d_arr, size_t N) {
    });
 
    if (num_groups > 1) {
-      sycl::event result_ready = q.submit([&](sycl::handler &h) {
-         h.depends_on(partials_ready);
-         sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
+      sycl::event result_ready = submit_or_wait_on_error(partials_ready, [&] {
+         return q.submit([&](sycl::handler &h) {
+            h.depends_on(partials_ready);
+            sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
 
-         auto finalize = [=](sycl::nd_item<1> item) {
-            const int lid = item.get_local_id(0);
-            Acc acc{};
-            for (size_t g = lid; g < num_groups; g += WG_SIZE) {
-               merge(acc, d_partial[g]);
-            }
-
-            loc[lid] = acc;
-            sycl::group_barrier(item.get_group());
-
-            for (int s = WG_SIZE / 2; s > 0; s >>= 1) {
-               if (lid < s) {
-                  Acc lhs = loc[lid];
-                  merge(lhs, loc[lid + s]);
-                  loc[lid] = lhs;
+            auto finalize = [=](sycl::nd_item<1> item) {
+               const int lid = item.get_local_id(0);
+               Acc acc{};
+               for (size_t g = lid; g < num_groups; g += WG_SIZE) {
+                  merge(acc, d_partial[g]);
                }
+
+               loc[lid] = acc;
                sycl::group_barrier(item.get_group());
-            }
 
-            if (lid == 0) {
-               d_partial[0].pri[0] = conv(loc[0]);
-            }
-         };
+               for (int s = WG_SIZE / 2; s > 0; s >>= 1) {
+                  if (lid < s) {
+                     Acc lhs = loc[lid];
+                     merge(lhs, loc[lid + s]);
+                     loc[lid] = lhs;
+                  }
+                  sycl::group_barrier(item.get_group());
+               }
 
-         h.parallel_for(sycl::nd_range<1>(WG_SIZE, WG_SIZE), finalize);
+               if (lid == 0) {
+                  d_partial[0].pri[0] = conv(loc[0]);
+               }
+            };
+
+            h.parallel_for(sycl::nd_range<1>(WG_SIZE, WG_SIZE), finalize);
+         });
       });
       result_ready.wait_and_throw();
    } else {
@@ -731,7 +799,6 @@ T sum_impl(sycl::queue &q, const T *d_arr, size_t N) {
    }
 
    const T result = from_bits<T>(to_bits(d_partial[0].pri[0]));
-   sycl::free(d_partial, q);
    return result;
 }
 
@@ -809,11 +876,8 @@ template <typename T> inline void run_device_environment_probe(sycl::queue &q) {
    constexpr B half_min_normal_bits = B(1) << (fp<T>::mant_dig - 2);
    constexpr B negative_zero_bits = B(1) << (sizeof(T) * 8 - 1);
 
-   EnvironmentProbeData<T> *probe =
-      sycl::malloc_shared<EnvironmentProbeData<T>>(1, q);
-   if (probe == nullptr) {
-      throw std::bad_alloc();
-   }
+   auto probe_owner = allocate_shared_usm<EnvironmentProbeData<T>>(1, q);
+   EnvironmentProbeData<T> *probe = probe_owner.get();
 
    probe->min_normal = std::numeric_limits<T>::min();
    probe->half = T(0.5);
@@ -825,25 +889,19 @@ template <typename T> inline void run_device_environment_probe(sycl::queue &q) {
    probe->three_quarters = T(0.75);
    probe->negative_zero = from_bits<T>(negative_zero_bits);
 
-   try {
-      q.submit([=](sycl::handler &h) {
-         h.single_task<EnvironmentProbeKernel<T>>([=]() {
-            probe->compiled_half_min_normal =
-               std::numeric_limits<T>::min() * T(0.5);
-            probe->half_min_normal = probe->min_normal * probe->half;
-            probe->twice_denorm_min = probe->denorm_min * probe->two;
-            probe->below_half_ulp =
-               probe->one + probe->epsilon * probe->quarter;
-            probe->above_half_ulp =
-               probe->one + probe->epsilon * probe->three_quarters;
-            probe->preserved_negative_zero = probe->negative_zero * probe->one;
-            probe->negative_zero_plus_zero = probe->negative_zero + T(0);
-         });
-      }).wait_and_throw();
-   } catch (...) {
-      sycl::free(probe, q);
-      throw;
-   }
+   q.submit([=](sycl::handler &h) {
+      h.single_task<EnvironmentProbeKernel<T>>([=]() {
+         probe->compiled_half_min_normal =
+            std::numeric_limits<T>::min() * T(0.5);
+         probe->half_min_normal = probe->min_normal * probe->half;
+         probe->twice_denorm_min = probe->denorm_min * probe->two;
+         probe->below_half_ulp = probe->one + probe->epsilon * probe->quarter;
+         probe->above_half_ulp =
+            probe->one + probe->epsilon * probe->three_quarters;
+         probe->preserved_negative_zero = probe->negative_zero * probe->one;
+         probe->negative_zero_plus_zero = probe->negative_zero + T(0);
+      });
+   }).wait_and_throw();
 
    const bool gradual_underflow =
       to_bits(probe->compiled_half_min_normal) == half_min_normal_bits &&
@@ -855,7 +913,6 @@ template <typename T> inline void run_device_environment_probe(sycl::queue &q) {
    const bool signed_zero =
       to_bits(probe->preserved_negative_zero) == negative_zero_bits &&
       to_bits(probe->negative_zero_plus_zero) == B(0);
-   sycl::free(probe, q);
 
    if (!gradual_underflow) {
       throw std::runtime_error(
@@ -1044,13 +1101,10 @@ T sum(sycl::queue &q, const T *arr, size_t N) {
       return detail::sum_impl<T, K, WG_SIZE>(q, arr, N);
    }
 
-   T *d_arr = sycl::malloc_device<T>(N, q);
-   q.memcpy(d_arr, arr, N * sizeof(T)).wait();
-
-   T result = detail::sum_impl<T, K, WG_SIZE>(q, d_arr, N);
-
-   sycl::free(d_arr, q);
-   return result;
+   auto device_owner = detail::allocate_device_usm<T>(N, q);
+   T *d_arr = device_owner.get();
+   q.memcpy(d_arr, arr, N * sizeof(T)).wait_and_throw();
+   return detail::sum_impl<T, K, WG_SIZE>(q, d_arr, N);
 }
 
 } // namespace adn
