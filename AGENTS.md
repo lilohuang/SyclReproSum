@@ -3,9 +3,9 @@
 ## Project overview
 
 Header-only SYCL library (`repro_sum.hpp`) for bit-reproducible,
-order-independent floating-point summation on GPU, implementing the
-Ahrens-Demmel-Nguyen (ADN) binned floating-point format. The binned
-primitives are adaptations of the ReproBLAS reference implementation
+order-independent floating-point summation across CPU and GPU devices. It
+implements the Ahrens-Demmel-Nguyen (ADN) binned floating-point format. The
+binned primitives are adaptations of the ReproBLAS reference implementation
 (see THIRD_PARTY_NOTICES); keep that attribution intact.
 
 Key invariant: **the result must be bit-identical for any input order,
@@ -22,22 +22,31 @@ Enforced by `.clang-format` + CI (`.github/workflows/format.yml`):
 - Pointer/reference symbols bind to the name: `int *p`, `int &r`.
 - Every `if` / `else` / `for` / `while` body is braced, even
   single-statement ones.
+- Use ASCII characters only in all project-authored files, filenames, comments,
+  string literals, tests, documentation, and commit messages. Never introduce
+  non-ASCII characters. Preserve vendored third-party content and required
+  license notices unchanged.
 - Run `clang-format -i repro_sum.hpp repro_test.cpp example.cpp`
   before committing.
 
 ## Layout
 
 - `repro_sum.hpp` - the entire library (public API: `adn::sum`).
-- `repro_test.cpp` - Google Test suite, value-parameterized over all GPUs (138 correctness cases per device +
-  `ADNSumBench` throughput benchmarks).
+- `repro_test.cpp` - Google Test suite, value-parameterized over all available
+  GPUs and CPUs (141 correctness cases and 2 `ADNSumBench` throughput
+  benchmarks per device), plus 7 cross-device cases and a version test.
 - `example.cpp` - minimal runnable usage example.
 - `third_party/googletest` - git submodule; never edit.
 
 ## Building and testing
 
 - Requires Intel DPC++ (`clang++ -fsycl`); set `DPCPP_HOME` if not in
-  `~/sycl_workspace`. GPU required to run tests.
+  `~/sycl_workspace`. At least one supported SYCL CPU or GPU device is required
+  to run the parameterized tests.
 - `make all` builds example + tests; `make test` runs the suite.
+- `make test` includes the 100M-element throughput benchmarks. For a quicker
+  correctness-only run, use `./repro_test "--gtest_filter=-*Bench*"`.
+- CI currently checks formatting only; build and device testing are local.
 - All tests must pass. New behavior needs new tests in
   `repro_test.cpp`, including a reproducibility check (shuffle the
   input, expect bit-identical results).

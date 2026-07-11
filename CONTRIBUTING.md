@@ -10,6 +10,10 @@ C++ code follows the rules encoded in [.clang-format](.clang-format):
 - **Every** `if` / `else` / `for` / `while` body is braced, even
   single-statement ones.
 - 80-column limit, C++17.
+- **ASCII only:** Use ASCII characters in all project-authored files, filenames,
+  comments, string literals, tests, documentation, and commit messages. Never
+  introduce non-ASCII characters. Preserve vendored third-party content and
+  required license notices unchanged.
 
 Format before committing:
 
