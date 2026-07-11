@@ -26,7 +26,7 @@ Enforced by `.clang-format` + CI (`.github/workflows/format.yml`):
   string literals, tests, documentation, and commit messages. Never introduce
   non-ASCII characters. Preserve vendored third-party content and required
   license notices unchanged.
-- Run `clang-format -i repro_sum.hpp repro_test.cpp example.cpp`
+- Run `clang-format-18 -i repro_sum.hpp repro_test.cpp example.cpp`
   before committing.
 
 ## Layout

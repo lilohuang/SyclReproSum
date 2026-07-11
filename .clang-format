@@ -1,4 +1,4 @@
-# C++ style for SyclReproSum
+# C++ style for SyclReproSum. Canonical formatter: clang-format 18.
 BasedOnStyle: LLVM
 Language: Cpp
 Standard: c++17

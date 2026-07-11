@@ -113,10 +113,9 @@ static std::vector<sycl::device> preferred_devices(
    for (const sycl::device &device : sycl::device::get_devices(type)) {
       const std::string name = device.get_info<sycl::info::device::name>();
       auto existing = result.end();
-      for (auto candidate = result.begin(); candidate != result.end();
-         ++candidate) {
-         if (candidate->get_info<sycl::info::device::name>() == name) {
-            existing = candidate;
+      for (auto it = result.begin(); it != result.end(); ++it) {
+         if (it->get_info<sycl::info::device::name>() == name) {
+            existing = it;
             break;
          }
       }

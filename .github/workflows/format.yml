@@ -13,6 +13,7 @@ jobs:
 
       - name: Check C++ formatting
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq clang-format
-          clang-format --version
-          clang-format --dry-run --Werror repro_sum.hpp repro_test.cpp example.cpp
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-format-18
+          clang-format-18 --version
+          clang-format-18 --dry-run --Werror repro_sum.hpp repro_test.cpp example.cpp

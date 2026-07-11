@@ -18,10 +18,10 @@ C++ code follows the rules encoded in [.clang-format](.clang-format):
 Format before committing:
 
 ```bash
-clang-format -i repro_sum.hpp repro_test.cpp example.cpp
+clang-format-18 -i repro_sum.hpp repro_test.cpp example.cpp
 ```
 
-CI rejects pull requests that are not clang-format clean.
+CI uses clang-format 18 and rejects pull requests that are not format clean.
 
 ## Building and testing
 
