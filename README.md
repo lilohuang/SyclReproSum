@@ -105,6 +105,7 @@ element-size bias of GB/s:
 
 | Device (backend) | `double` sum / baseline* (GElements/s) | `float` sum / baseline* (GElements/s) |
 |---|---:|---:|
+| NVIDIA GB10 (CUDA) | 26.3 / 31.7 (1.2x slower) | 55.5 / 62.9 (1.1x slower) |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | 48.7 / 77.0 (1.6x slower) | 121.2 / 124.5 (1.0x slower) |
 | Intel Graphics [0x7d67] (Level-Zero) | 1.7 / 6.6 (3.8x slower) | 4.1 / 12.5 (3.0x slower) |
 | Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.8 (13.6x slower) | 0.6 / 7.4 (12.3x slower) |
@@ -124,13 +125,15 @@ and runtime effects. The slowdown factor is `baseline / sum`.
 ### Cross-device reproducibility
 
 The sum is bit-identical **across CPUs, GPU vendors, and backends**, not
-just across runs. Verified on this machine (single fat binary, device
-code for all targets):
+just across runs. Verified on the following devices and backends, with a
+single fat binary providing device code for all targets on each system:
 
-| | NVIDIA RTX PRO 4500 Blackwell (CUDA) | Intel Graphics [0x7d67] (Level-Zero) | Intel Core Ultra 7 265 CPU (OpenCL) |
-|---|---|---|---|
-| `double`, 1M wide-range | `0x430FC878C605717F` | `0x430FC878C605717F` | `0x430FC878C605717F` |
-| shuffled input order | same bits | same bits | same bits |
+| Device (backend) | `double`, 1M wide-range | Shuffled input order |
+|---|---|---|
+| NVIDIA GB10 (CUDA) | `0x430FC878C605717F` | same bits |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA) | `0x430FC878C605717F` | same bits |
+| Intel Graphics [0x7d67] (Level-Zero) | `0x430FC878C605717F` | same bits |
+| Intel Core Ultra 7 265 CPU (OpenCL) | `0x430FC878C605717F` | same bits |
 
 The test suite chooses one backend per distinct device name, preferring
 Level-Zero, then CUDA, then other backends, with OpenCL as the fallback.
