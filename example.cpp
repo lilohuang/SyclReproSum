@@ -3,7 +3,7 @@
 
 /**
  * @file example.cpp
- * @brief Minimal usage example for adn::sum.
+ * @brief Minimal usage example for adn::sum and adn::cumsum.
  *
  * Sums data that defeats naive floating-point summation (large values
  * cancelling around a small signal) and shows that the result is
@@ -44,6 +44,12 @@ int main() {
    std::printf("shuffled input = %.17g (%s)\n", shuffled,
       shuffled == result ? "bit-identical" : "MISMATCH");
 
+   // Every element is the reproducible sum of the input prefix ending there.
+   std::vector<double> prefixes(data.size());
+   adn::cumsum(q, data.data(), prefixes.data(), data.size());
+   std::printf("last prefix     = %.17g (%s)\n", prefixes.back(),
+      prefixes.back() == shuffled ? "matches sum" : "MISMATCH");
+
    // Device-pointer overload with more folds for higher accuracy:
    double *d_arr = sycl::malloc_device<double>(data.size(), q);
    q.memcpy(d_arr, data.data(), data.size() * sizeof(double)).wait();
@@ -51,5 +57,5 @@ int main() {
    std::printf("K=6 folds      = %.17g\n", k6);
    sycl::free(d_arr, q);
 
-   return shuffled == result ? 0 : 1;
+   return shuffled == result && prefixes.back() == shuffled ? 0 : 1;
 }

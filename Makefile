@@ -14,10 +14,15 @@
 #  Configuration:
 #    DPCPP_HOME      - path to DPC++ installation (default: ~/sycl_workspace)
 #    SYCL_TARGETS    - offload targets (default: nvptx64-nvidia-cuda,spir64)
+#    ONEDPL_INC      - oneDPL include directory (auto-detected when possible)
 # ============================================================
 
 DPCPP_HOME  ?= $(HOME)/sycl_workspace
 SYCL_TARGETS ?= nvptx64-nvidia-cuda,spir64
+ONEDPL_INC  ?= $(firstword \
+	$(wildcard /opt/intel/oneapi/dpl/latest/include) \
+	$(wildcard $(DPCPP_HOME)/oneDPL*/include) \
+	/opt/intel/oneapi/dpl/latest/include)
 
 CXX          = $(DPCPP_HOME)/llvm/build/bin/clang++
 CXXFLAGS     = -std=c++17 -O3 -fsycl -fsycl-targets=$(SYCL_TARGETS)
@@ -57,7 +62,7 @@ repro_example: example.cpp repro_sum.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 repro_test: repro_test.cpp repro_sum.hpp | gtest
-	$(CXX) $(CXXFLAGS) -I$(GTEST_INC) $< \
+	$(CXX) $(CXXFLAGS) -isystem $(ONEDPL_INC) -I$(GTEST_INC) $< \
 		$(GTEST_LIB)/libgtest.a $(GTEST_LIB)/libgtest_main.a \
 		-lpthread -o $@
 
@@ -91,21 +96,24 @@ test-device-eval: | $(TEST_VARIANT_DIR)
 
 $(HOSTILE_HOST_TEST): repro_test.cpp repro_sum.hpp Makefile | gtest \
 		$(TEST_VARIANT_DIR)
-	$(CXX) $(CXXFLAGS) $(HOSTILE_HOST_FLAGS) -I$(GTEST_INC) $< \
+	$(CXX) $(CXXFLAGS) $(HOSTILE_HOST_FLAGS) -isystem $(ONEDPL_INC) \
+		-I$(GTEST_INC) $< \
 		$(GTEST_LIB)/libgtest.a $(GTEST_LIB)/libgtest_main.a \
 		-lpthread -o $@
 
 $(DEVICE_DENORM_TEST): repro_test.cpp repro_sum.hpp Makefile | gtest \
 		$(TEST_VARIANT_DIR)
 	$(CXX) $(CXXFLAGS) -fdenormal-fp-math=positive-zero \
-		-DADN_TEST_EXPECT_DEVICE_REJECTION -I$(GTEST_INC) $< \
+		-DADN_TEST_EXPECT_DEVICE_REJECTION -isystem $(ONEDPL_INC) \
+		-I$(GTEST_INC) $< \
 		$(GTEST_LIB)/libgtest.a $(GTEST_LIB)/libgtest_main.a \
 		-lpthread -o $@
 
 $(DEVICE_NOSZERO_TEST): repro_test.cpp repro_sum.hpp Makefile | gtest \
 		$(TEST_VARIANT_DIR)
 	$(CXX) $(CXXFLAGS) -fno-signed-zeros \
-		-DADN_TEST_EXPECT_DEVICE_REJECTION -I$(GTEST_INC) $< \
+		-DADN_TEST_EXPECT_DEVICE_REJECTION -isystem $(ONEDPL_INC) \
+		-I$(GTEST_INC) $< \
 		$(GTEST_LIB)/libgtest.a $(GTEST_LIB)/libgtest_main.a \
 		-lpthread -o $@
 

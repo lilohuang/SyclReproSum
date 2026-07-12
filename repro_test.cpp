@@ -6,12 +6,14 @@
  * @brief Google Test suite for Ahrens-Demmel-Nguyen K-Fold reproducible
  * summation.
  *
- * Tests correctness, reproducibility, and edge-case handling of
- * adn::sum across various input patterns, K configurations, and
+ * Tests correctness, reproducibility, and edge-case handling of adn::sum and
+ * adn::cumsum across various input patterns, K configurations, and
  * floating-point types (double and float).
  */
 
 #include <gtest/gtest.h>
+#include <oneapi/dpl/execution>
+#include <oneapi/dpl/numeric>
 #include <sycl/sycl.hpp>
 #include <atomic>
 #include <vector>
@@ -29,6 +31,7 @@
 #include <limits>
 #include <mutex>
 #include <thread>
+#include <functional>
 
 #if defined(__SSE__)
 #include <xmmintrin.h>
@@ -84,6 +87,17 @@ static ::testing::AssertionResult assert_bit_equal(
 }
 
 #define EXPECT_BIT_EQ(val, ref) EXPECT_PRED_FORMAT2(assert_bit_equal, val, ref)
+
+template <typename T>
+static void expect_bit_identical_arrays(const std::vector<T> &actual,
+   const std::vector<T> &expected, const std::string &context) {
+   ASSERT_EQ(actual.size(), expected.size()) << context;
+   for (size_t i = 0; i < actual.size(); ++i) {
+      if (bits_of(actual[i]) != bits_of(expected[i])) {
+         EXPECT_BIT_EQ(actual[i], expected[i]) << context << ", prefix " << i;
+      }
+   }
+}
 
 // ============================================================
 //  Device enumeration
@@ -2100,6 +2114,557 @@ TEST_P(ADNSumTest, OrderIndependent_TinyNormals_Float) {
 }
 
 // ============================================================
+//  Reproducible cumulative sums
+// ============================================================
+
+template <int K = 3, typename T, typename IndexRange>
+static void expect_cumsum_matches_sum(sycl::queue &q,
+   const std::vector<T> &input, const std::vector<T> &output,
+   const IndexRange &indices) {
+   ASSERT_EQ(output.size(), input.size());
+   for (size_t i : indices) {
+      ASSERT_LT(i, input.size());
+      EXPECT_BIT_EQ(output[i], adn::sum<K>(q, input.data(), i + 1))
+         << "prefix " << i;
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_EmptyAndInvalidPointers) {
+   double output = 7.0;
+   EXPECT_NO_THROW(
+      adn::cumsum(queue(), static_cast<const double *>(nullptr), &output, 0));
+   EXPECT_EQ(output, 7.0);
+   EXPECT_THROW(
+      adn::cumsum(queue(), static_cast<const double *>(nullptr), &output, 1),
+      std::invalid_argument);
+   EXPECT_THROW(
+      adn::cumsum(queue(), &output, static_cast<double *>(nullptr), 1),
+      std::invalid_argument);
+}
+
+TEST_P(ADNSumTest, Cumsum_CapacityExceededRejected) {
+   if constexpr (std::numeric_limits<size_t>::max() >
+      adn::max_reproducible_count<float>) {
+      float input = 1.0f;
+      float output = 0.0f;
+      const size_t too_many =
+         static_cast<size_t>(adn::max_reproducible_count<float> + 1);
+      EXPECT_THROW(
+         adn::cumsum(queue(), &input, &output, too_many), std::length_error);
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_DoubleMatchesEveryPrefixSum) {
+   std::vector<double> input{
+      1e16, 1.0, -1e16, 3.0, -2.0, 1e-200, -1e-200, 0.25};
+   std::vector<double> output(input.size());
+
+   adn::cumsum(queue(), input.data(), output.data(), input.size());
+
+   for (size_t i = 0; i < input.size(); ++i) {
+      const double expected = adn::sum(queue(), input.data(), i + 1);
+      EXPECT_BIT_EQ(output[i], expected) << "prefix " << i;
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_FloatMatchesEveryPrefixSum) {
+   std::vector<float> input{
+      1e8f, 1.0f, -1e8f, 3.0f, -2.0f, 1e-30f, -1e-30f, 0.25f};
+   std::vector<float> output(input.size());
+
+   adn::cumsum(queue(), input.data(), output.data(), input.size());
+
+   for (size_t i = 0; i < input.size(); ++i) {
+      const float expected = adn::sum(queue(), input.data(), i + 1);
+      EXPECT_BIT_EQ(output[i], expected) << "prefix " << i;
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_SizeBoundaryMatrix) {
+   const size_t wg64_sizes[] = {1, 2, 7, 8, 9, 63, 64, 65, 511, 512, 513, 4095,
+      4096, 4097, 32767, 32768, 32769};
+   for (size_t N : wg64_sizes) {
+      std::vector<double> input(N, 1.0);
+      std::vector<double> output(N);
+      adn::cumsum<3, 64>(queue(), input.data(), output.data(), N);
+      for (size_t i = 0; i < N; ++i) {
+         EXPECT_EQ(output[i], static_cast<double>(i + 1)) << "N=" << N;
+      }
+   }
+
+   const size_t default_sizes[] = {2047, 2048, 2049};
+   for (size_t N : default_sizes) {
+      std::vector<float> input(N, 1.0f);
+      std::vector<float> output(N);
+      adn::cumsum(queue(), input.data(), output.data(), N);
+      for (size_t i = 0; i < N; ++i) {
+         EXPECT_EQ(output[i], static_cast<float>(i + 1)) << "N=" << N;
+      }
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_WorkGroupSizeIndependent) {
+   std::mt19937 gen(91);
+   std::uniform_real_distribution<double> dist(-1e12, 1e12);
+   std::vector<double> input(16387);
+   for (double &x : input) {
+      x = dist(gen);
+   }
+   for (size_t i = 0; i + 2 < input.size(); i += 97) {
+      input[i] = 1e16;
+      input[i + 1] = -1e16;
+      input[i + 2] = 1.0;
+   }
+
+   std::vector<double> wg64(input.size());
+   std::vector<double> wg128(input.size());
+   std::vector<double> wg256(input.size());
+   std::vector<double> wg512(input.size());
+   adn::cumsum<3, 64>(queue(), input.data(), wg64.data(), input.size());
+   adn::cumsum<3, 128>(queue(), input.data(), wg128.data(), input.size());
+   adn::cumsum<3, 256>(queue(), input.data(), wg256.data(), input.size());
+   adn::cumsum<3, 512>(queue(), input.data(), wg512.data(), input.size());
+
+   for (size_t i = 0; i < input.size(); ++i) {
+      EXPECT_BIT_EQ(wg128[i], wg64[i]) << "WG_SIZE=128, prefix " << i;
+      EXPECT_BIT_EQ(wg256[i], wg64[i]) << "WG_SIZE=256, prefix " << i;
+      EXPECT_BIT_EQ(wg512[i], wg64[i]) << "WG_SIZE=512, prefix " << i;
+   }
+
+   if (supports_wg_size_1024<double, 3>(queue().get_device())) {
+      std::vector<double> wg1024(input.size());
+      adn::cumsum<3, 1024>(queue(), input.data(), wg1024.data(), input.size());
+      for (size_t i = 0; i < input.size(); ++i) {
+         EXPECT_BIT_EQ(wg1024[i], wg64[i]) << "WG_SIZE=1024, prefix " << i;
+      }
+   }
+   EXPECT_BIT_EQ(wg64.back(), adn::sum(queue(), input.data(), input.size()));
+}
+
+TEST_P(ADNSumTest, Cumsum_RecursiveTileScanMatchesSum) {
+   constexpr size_t N = 40003;
+   std::mt19937 gen(17);
+   std::uniform_real_distribution<double> dist(-1e8, 1e8);
+   std::vector<double> input(N);
+   for (double &x : input) {
+      x = dist(gen);
+   }
+   std::vector<double> output(N);
+
+   // WG_SIZE=64 gives 79 tiles, forcing a recursive scan of tile totals.
+   adn::cumsum<3, 64>(queue(), input.data(), output.data(), input.size());
+
+   const size_t checkpoints[] = {0, 1, 510, 511, 512, 32767, 32768, N - 1};
+   for (size_t i : checkpoints) {
+      EXPECT_BIT_EQ(output[i], adn::sum(queue(), input.data(), i + 1))
+         << "prefix " << i;
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_ThreeLevelRecursiveTileScan) {
+   // WG_SIZE=64 has 512 elements per tile.  This creates 4097 tiles, whose
+   // group totals require 65 groups and then 2 groups: three recursive levels.
+   constexpr size_t N = size_t(64) * 64 * 64 * 8 + 17;
+   std::mt19937 gen(117);
+   std::uniform_real_distribution<double> dist(-1e6, 1e6);
+   std::vector<double> input(N);
+   for (double &x : input) {
+      x = dist(gen);
+   }
+   for (size_t i = 0; i + 2 < N; i += 8191) {
+      input[i] = 1e16;
+      input[i + 1] = -1e16;
+      input[i + 2] = 1.0;
+   }
+
+   std::vector<double> wg64(N);
+   std::vector<double> wg256(N);
+   adn::cumsum<3, 64>(queue(), input.data(), wg64.data(), N);
+   adn::cumsum<3, 256>(queue(), input.data(), wg256.data(), N);
+
+   ASSERT_EQ(std::memcmp(wg64.data(), wg256.data(), N * sizeof(double)), 0);
+   const size_t checkpoints[] = {
+      0, 7, 8, 510, 511, 512, 32767, 32768, 2097151, 2097152, N - 1};
+   expect_cumsum_matches_sum(queue(), input, wg64, checkpoints);
+}
+
+TEST_P(ADNSumTest, Cumsum_InPlaceHostPointer) {
+   std::vector<double> values(4099, 1.0);
+   values[0] = 1e16;
+   values[1] = -1e16;
+   std::vector<double> expected(values.size());
+   adn::cumsum(queue(), values.data(), expected.data(), values.size());
+
+   adn::cumsum(queue(), values.data(), values.data(), values.size());
+
+   for (size_t i = 0; i < values.size(); ++i) {
+      EXPECT_BIT_EQ(values[i], expected[i]) << "prefix " << i;
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_DeviceUSMAndInPlace) {
+   constexpr size_t N = 4099;
+   std::vector<float> input(N);
+   for (size_t i = 0; i < N; ++i) {
+      input[i] = static_cast<float>(static_cast<int>(i % 19) - 9) * 0.25f;
+   }
+   std::vector<float> expected(N);
+   adn::cumsum(queue(), input.data(), expected.data(), N);
+
+   float *device = sycl::malloc_device<float>(N, queue());
+   ASSERT_NE(device, nullptr);
+   queue().memcpy(device, input.data(), N * sizeof(float)).wait_and_throw();
+   adn::cumsum(queue(), device, device, N);
+
+   std::vector<float> actual(N);
+   queue().memcpy(actual.data(), device, N * sizeof(float)).wait_and_throw();
+   sycl::free(device, queue());
+
+   for (size_t i = 0; i < N; ++i) {
+      EXPECT_BIT_EQ(actual[i], expected[i]) << "prefix " << i;
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_MixedHostAndDevicePointers) {
+   constexpr size_t N = 2051;
+   std::vector<double> input(N);
+   for (size_t i = 0; i < N; ++i) {
+      input[i] = static_cast<double>(static_cast<int>(i % 23) - 11) * 0.125;
+   }
+   std::vector<double> expected(N);
+   adn::cumsum(queue(), input.data(), expected.data(), N);
+
+   auto device_input = adn::detail::allocate_device_usm<double>(N, queue());
+   auto device_output = adn::detail::allocate_device_usm<double>(N, queue());
+   queue()
+      .memcpy(device_input.get(), input.data(), N * sizeof(double))
+      .wait_and_throw();
+
+   std::vector<double> host_output(N);
+   adn::cumsum(
+      queue(), device_input.get(), host_output.data(), host_output.size());
+   adn::cumsum(queue(), input.data(), device_output.get(), input.size());
+
+   std::vector<double> copied_output(N);
+   queue()
+      .memcpy(copied_output.data(), device_output.get(), N * sizeof(double))
+      .wait_and_throw();
+   for (size_t i = 0; i < N; ++i) {
+      EXPECT_BIT_EQ(host_output[i], expected[i]) << "host output " << i;
+      EXPECT_BIT_EQ(copied_output[i], expected[i]) << "device output " << i;
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_OutputBoundsAndHostSharedUSM) {
+   constexpr size_t N = 2053;
+   constexpr double LEFT_CANARY = 1234567.0;
+   constexpr double RIGHT_CANARY = -7654321.0;
+   std::vector<double> input(N);
+   for (size_t i = 0; i < N; ++i) {
+      input[i] = static_cast<double>(static_cast<int>(i % 31) - 15) * 0.5;
+   }
+   std::vector<double> expected(N);
+   adn::cumsum(queue(), input.data(), expected.data(), N);
+
+   std::vector<double> guarded(N + 2);
+   guarded.front() = LEFT_CANARY;
+   guarded.back() = RIGHT_CANARY;
+   adn::cumsum(queue(), input.data(), guarded.data() + 1, N);
+   EXPECT_BIT_EQ(guarded.front(), LEFT_CANARY);
+   EXPECT_BIT_EQ(guarded.back(), RIGHT_CANARY);
+   EXPECT_EQ(
+      std::memcmp(guarded.data() + 1, expected.data(), N * sizeof(double)), 0);
+
+   const sycl::device &device = queue().get_device();
+   if (device.has(sycl::aspect::usm_shared_allocations)) {
+      auto shared_input = adn::detail::allocate_shared_usm<double>(N, queue());
+      auto shared_output =
+         adn::detail::allocate_shared_usm<double>(N + 2, queue());
+      std::copy(input.begin(), input.end(), shared_input.get());
+      shared_output.get()[0] = LEFT_CANARY;
+      shared_output.get()[N + 1] = RIGHT_CANARY;
+      adn::cumsum(queue(), shared_input.get(), shared_output.get() + 1, N);
+      EXPECT_BIT_EQ(shared_output.get()[0], LEFT_CANARY);
+      EXPECT_BIT_EQ(shared_output.get()[N + 1], RIGHT_CANARY);
+      EXPECT_EQ(std::memcmp(shared_output.get() + 1, expected.data(),
+                   N * sizeof(double)),
+         0);
+   }
+
+   if (device.has(sycl::aspect::usm_host_allocations)) {
+      adn::detail::UsmUniquePtr<double> host_input(
+         sycl::malloc_host<double>(N, queue()),
+         adn::detail::UsmDeleter<double>{queue().get_context()});
+      adn::detail::UsmUniquePtr<double> host_output(
+         sycl::malloc_host<double>(N, queue()),
+         adn::detail::UsmDeleter<double>{queue().get_context()});
+      ASSERT_NE(host_input.get(), nullptr);
+      ASSERT_NE(host_output.get(), nullptr);
+      std::copy(input.begin(), input.end(), host_input.get());
+      adn::cumsum(queue(), host_input.get(), host_output.get(), N);
+      EXPECT_EQ(
+         std::memcmp(host_output.get(), expected.data(), N * sizeof(double)),
+         0);
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_MoreFoldsMatchPrefixSum) {
+   std::mt19937 gen(61);
+   std::uniform_real_distribution<double> dist(-1e100, 1e100);
+   std::vector<double> input(1031);
+   for (double &x : input) {
+      x = dist(gen);
+   }
+   std::vector<double> output(input.size());
+   adn::cumsum<6>(queue(), input.data(), output.data(), input.size());
+
+   const size_t checkpoints[] = {0, 7, 8, 511, 1023, 1030};
+   for (size_t i : checkpoints) {
+      EXPECT_BIT_EQ(output[i], adn::sum<6>(queue(), input.data(), i + 1))
+         << "prefix " << i;
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_FoldConfigurationsMatchPrefixSum) {
+   std::mt19937 gen(211);
+   std::uniform_real_distribution<double> double_dist(-1e100, 1e100);
+   std::vector<double> double_input(2057);
+   for (double &x : double_input) {
+      x = double_dist(gen);
+   }
+   std::vector<double> double_k2(double_input.size());
+   adn::cumsum<2>(
+      queue(), double_input.data(), double_k2.data(), double_input.size());
+
+   const size_t double_checkpoints[] = {0, 7, 8, 511, 512, 2047, 2056};
+   expect_cumsum_matches_sum<2>(
+      queue(), double_input, double_k2, double_checkpoints);
+
+   std::uniform_real_distribution<float> float_dist(-1e20f, 1e20f);
+   std::vector<float> float_input(4099);
+   for (float &x : float_input) {
+      x = float_dist(gen);
+   }
+   std::vector<float> float_k2(float_input.size());
+   std::vector<float> float_k8(float_input.size());
+   std::vector<float> float_k12(float_input.size());
+   adn::cumsum<2>(
+      queue(), float_input.data(), float_k2.data(), float_input.size());
+   adn::cumsum<8>(
+      queue(), float_input.data(), float_k8.data(), float_input.size());
+   adn::cumsum<12>(
+      queue(), float_input.data(), float_k12.data(), float_input.size());
+
+   const size_t float_checkpoints[] = {
+      0, 7, 8, 511, 512, 2047, 2048, 4095, 4098};
+   expect_cumsum_matches_sum<2>(
+      queue(), float_input, float_k2, float_checkpoints);
+   expect_cumsum_matches_sum<8>(
+      queue(), float_input, float_k8, float_checkpoints);
+   expect_cumsum_matches_sum<12>(
+      queue(), float_input, float_k12, float_checkpoints);
+}
+
+TEST_P(ADNSumTest, Cumsum_DoubleExtremeNumericPrefixes) {
+   constexpr size_t N = 8195;
+   std::vector<double> input(N);
+   for (size_t i = 0; i < N; ++i) {
+      const int exponent = static_cast<int>((i * 37) % 2001) - 1000;
+      const double mantissa = 1.0 + static_cast<double>(i % 17) / 32.0;
+      input[i] = std::ldexp(i % 2 == 0 ? mantissa : -mantissa, exponent);
+   }
+
+   const double denorm = std::numeric_limits<double>::denorm_min();
+   const double max = std::numeric_limits<double>::max();
+   input[7] = denorm;
+   input[8] = -denorm;
+   input[511] = max;
+   input[512] = -max;
+   input[2047] = 1e308;
+   input[2048] = 1e308;
+   input[2049] = -1e308;
+   input[2050] = -1e308;
+   input[4095] = 1e16;
+   input[4096] = 1.0;
+   input[4097] = -1e16;
+   input[8191] = std::numeric_limits<double>::min();
+
+   std::vector<double> output(N);
+   adn::cumsum(queue(), input.data(), output.data(), N);
+   const size_t checkpoints[] = {0, 6, 7, 8, 9, 510, 511, 512, 513, 2046, 2047,
+      2048, 2049, 2050, 2051, 4094, 4095, 4096, 4097, 4098, 8190, 8191, 8192,
+      N - 1};
+   expect_cumsum_matches_sum(queue(), input, output, checkpoints);
+}
+
+TEST_P(ADNSumTest, Cumsum_FloatExtremeNumericPrefixes) {
+   constexpr size_t N = 4099;
+   std::vector<float> input(N);
+   for (size_t i = 0; i < N; ++i) {
+      const int exponent = static_cast<int>((i * 29) % 241) - 120;
+      const float mantissa = 1.0f + static_cast<float>(i % 13) / 32.0f;
+      input[i] = std::ldexp(i % 2 == 0 ? mantissa : -mantissa, exponent);
+   }
+
+   const float denorm = std::numeric_limits<float>::denorm_min();
+   const float max = std::numeric_limits<float>::max();
+   input[7] = denorm;
+   input[8] = -denorm;
+   input[511] = max;
+   input[512] = -max;
+   input[2047] = 1e30f;
+   input[2048] = 1.0f;
+   input[2049] = -1e30f;
+   input[4095] = std::numeric_limits<float>::min();
+
+   std::vector<float> output(N);
+   adn::cumsum(queue(), input.data(), output.data(), N);
+   const size_t checkpoints[] = {0, 6, 7, 8, 9, 510, 511, 512, 513, 2046, 2047,
+      2048, 2049, 2050, 4094, 4095, 4096, N - 1};
+   expect_cumsum_matches_sum(queue(), input, output, checkpoints);
+}
+
+TEST_P(ADNSumTest, Cumsum_RandomizedDifferentialAndRepeatability) {
+   for (unsigned seed = 1; seed <= 8; ++seed) {
+      const size_t N = 3000 + size_t(seed) * 733;
+      std::mt19937 gen(seed * 101);
+      std::uniform_real_distribution<double> mantissa_dist(0.5, 1.0);
+      std::uniform_int_distribution<int> exponent_dist(-1000, 1000);
+      std::uniform_int_distribution<int> sign_dist(0, 1);
+      std::vector<double> input(N);
+      for (double &x : input) {
+         const double mantissa = mantissa_dist(gen);
+         x = std::ldexp(
+            sign_dist(gen) == 0 ? mantissa : -mantissa, exponent_dist(gen));
+      }
+      for (size_t i = 0; i + 2 < N; i += 257) {
+         input[i] = 1e200;
+         input[i + 1] = -1e200;
+         input[i + 2] = 1.0;
+      }
+
+      std::vector<double> first(N);
+      std::vector<double> second(N);
+      adn::cumsum(queue(), input.data(), first.data(), N);
+      adn::cumsum(queue(), input.data(), second.data(), N);
+      ASSERT_EQ(std::memcmp(first.data(), second.data(), N * sizeof(double)), 0)
+         << "seed " << seed;
+
+      std::vector<size_t> checkpoints{
+         0, 1, 6, 7, 8, 9, 510, 511, 512, 513, 2046, 2047, 2048, 2049, N - 1};
+      std::uniform_int_distribution<size_t> index_dist(0, N - 1);
+      for (int i = 0; i < 12; ++i) {
+         checkpoints.push_back(index_dist(gen));
+      }
+      std::sort(checkpoints.begin(), checkpoints.end());
+      checkpoints.erase(std::unique(checkpoints.begin(), checkpoints.end()),
+         checkpoints.end());
+      expect_cumsum_matches_sum(queue(), input, first, checkpoints);
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_UniformDecimalReproducible) {
+   // Require every prefix to remain identical across repeated runs and
+   // work-group sizes for a long uniform decimal input.
+   constexpr size_t N = 250000;
+   constexpr int RUNS = 100;
+   std::vector<double> input(N, 0.1);
+   auto device_input = adn::detail::allocate_device_usm<double>(N, queue());
+   auto device_output = adn::detail::allocate_device_usm<double>(N, queue());
+   queue()
+      .memcpy(device_input.get(), input.data(), N * sizeof(double))
+      .wait_and_throw();
+
+   adn::cumsum(queue(), device_input.get(), device_output.get(), input.size());
+   std::vector<double> reference(N);
+   queue()
+      .memcpy(reference.data(), device_output.get(), N * sizeof(double))
+      .wait_and_throw();
+   EXPECT_BIT_EQ(
+      reference.back(), adn::sum(queue(), device_input.get(), input.size()));
+
+   std::vector<double> actual(N);
+   for (int run = 0; run < RUNS; ++run) {
+      switch (run % 4) {
+         case 0:
+            adn::cumsum<3, 64>(
+               queue(), device_input.get(), device_output.get(), N);
+            break;
+         case 1:
+            adn::cumsum<3, 128>(
+               queue(), device_input.get(), device_output.get(), N);
+            break;
+         case 2:
+            adn::cumsum<3, 256>(
+               queue(), device_input.get(), device_output.get(), N);
+            break;
+         default:
+            adn::cumsum<3, 512>(
+               queue(), device_input.get(), device_output.get(), N);
+            break;
+      }
+      queue()
+         .memcpy(actual.data(), device_output.get(), N * sizeof(double))
+         .wait_and_throw();
+      ASSERT_EQ(
+         std::memcmp(actual.data(), reference.data(), N * sizeof(double)), 0)
+         << "run " << run;
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_SpecialValuesMatchPrefixSum) {
+   const double inf = std::numeric_limits<double>::infinity();
+   std::vector<double> nan_input(4099, 1.0);
+   nan_input[2047] = double_from_bits(UINT64_C(0xfff8000000001234));
+   std::vector<double> nan_output(nan_input.size());
+   adn::cumsum(queue(), nan_input.data(), nan_output.data(), nan_input.size());
+   const size_t nan_checkpoints[] = {0, 2046, 2047, 2048, 4095, 4098};
+   expect_cumsum_matches_sum(queue(), nan_input, nan_output, nan_checkpoints);
+   EXPECT_EQ(bits_of(nan_output[2047]), UINT64_C(0x7ff8000000000000));
+   EXPECT_EQ(bits_of(nan_output.back()), UINT64_C(0x7ff8000000000000));
+
+   std::vector<double> inf_input(4099, 1.0);
+   inf_input[2047] = inf;
+   inf_input[2048] = -inf;
+   std::vector<double> inf_output(inf_input.size());
+   adn::cumsum(queue(), inf_input.data(), inf_output.data(), inf_input.size());
+   const size_t inf_checkpoints[] = {0, 2046, 2047, 2048, 2049, 4098};
+   expect_cumsum_matches_sum(queue(), inf_input, inf_output, inf_checkpoints);
+   EXPECT_EQ(inf_output[2047], inf);
+   EXPECT_EQ(bits_of(inf_output[2048]), UINT64_C(0x7ff8000000000000));
+}
+
+TEST_P(ADNSumTest, Cumsum_ShuffledBlocksKeepBoundaryBits) {
+   constexpr size_t BLOCK_SIZE = 257;
+   constexpr size_t BLOCKS = 8;
+   std::vector<double> base(BLOCK_SIZE * BLOCKS);
+   std::mt19937 gen(73);
+   std::uniform_real_distribution<double> dist(-1e10, 1e10);
+   for (double &x : base) {
+      x = dist(gen);
+   }
+
+   std::vector<double> reference(base.size());
+   adn::cumsum(queue(), base.data(), reference.data(), base.size());
+
+   for (unsigned seed = 1; seed <= 4; ++seed) {
+      std::vector<double> shuffled = base;
+      std::mt19937 rng(seed);
+      for (size_t block = 0; block < BLOCKS; ++block) {
+         const auto first = shuffled.begin() + block * BLOCK_SIZE;
+         std::shuffle(first, first + BLOCK_SIZE, rng);
+      }
+      std::vector<double> output(shuffled.size());
+      adn::cumsum(queue(), shuffled.data(), output.data(), shuffled.size());
+      for (size_t block = 0; block < BLOCKS; ++block) {
+         const size_t boundary = (block + 1) * BLOCK_SIZE - 1;
+         EXPECT_BIT_EQ(output[boundary], reference[boundary])
+            << "seed " << seed << ", block " << block;
+      }
+   }
+}
+
+// ============================================================
 //  Throughput benchmarks (informational)
 //
 //  Measures adn::sum against a plain (non-reproducible)
@@ -2189,6 +2754,95 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
    CPUs, ADNSumBench, ::testing::ValuesIn(all_cpus()), device_label);
 
+template <typename T> class ADNCumsumBaselinePolicy;
+
+class ADNCumsumBench : public ADNSumTest {
+protected:
+   struct Result {
+      double baseline_gelem_s;
+      double binned_gelem_s;
+   };
+
+   /// @brief Time f() over @p runs iterations, return avg milliseconds.
+   template <typename F> static double time_ms(F &&f, int runs = 10) {
+      f(); // warmup
+      auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < runs; ++i) {
+         f();
+      }
+      auto t1 = std::chrono::steady_clock::now();
+      return std::chrono::duration<double, std::milli>(t1 - t0).count() / runs;
+   }
+
+   /// @brief Benchmark oneDPL inclusive_scan vs adn::cumsum on N randoms.
+   template <typename T> Result run(size_t N) {
+      std::mt19937 gen(7);
+      std::uniform_real_distribution<T> dist(T(-1e6), T(1e6));
+      std::vector<T> input(N);
+      for (T &x : input) {
+         x = dist(gen);
+      }
+
+      auto device_input = adn::detail::allocate_device_usm<T>(N, queue());
+      auto device_output = adn::detail::allocate_device_usm<T>(N, queue());
+      queue()
+         .memcpy(device_input.get(), input.data(), N * sizeof(T))
+         .wait_and_throw();
+      auto policy =
+         oneapi::dpl::execution::make_device_policy<ADNCumsumBaselinePolicy<T>>(
+            queue());
+
+      const double baseline_ms = time_ms([&] {
+         oneapi::dpl::inclusive_scan(policy, device_input.get(),
+            device_input.get() + N, device_output.get(), std::plus<T>{});
+         queue().wait_and_throw();
+      });
+      T baseline_last;
+      queue()
+         .memcpy(&baseline_last, device_output.get() + N - 1, sizeof(T))
+         .wait_and_throw();
+
+      const double binned_ms = time_ms([&] {
+         adn::cumsum(queue(), device_input.get(), device_output.get(), N);
+      });
+      T binned_last;
+      queue()
+         .memcpy(&binned_last, device_output.get() + N - 1, sizeof(T))
+         .wait_and_throw();
+      EXPECT_TRUE(std::isfinite(baseline_last));
+      EXPECT_TRUE(std::isfinite(binned_last));
+
+      const double billions = static_cast<double>(N) / 1e9;
+      return {billions / (baseline_ms / 1e3), billions / (binned_ms / 1e3)};
+   }
+
+   template <typename T> void report(const char *type_name, size_t N) {
+      const Result result = run<T>(N);
+      const double slowdown = result.baseline_gelem_s / result.binned_gelem_s;
+      RecordProperty("oneDPL_GElemPerSec", result.baseline_gelem_s);
+      RecordProperty("binned_GElemPerSec", result.binned_gelem_s);
+      std::printf("  [bench] %s: %-6s N=%zu  oneDPL scan %7.3f G "
+                  "elements/s | adn::cumsum %7.3f G elements/s "
+                  "(%.1fx slower)\n",
+         GetParam().get_info<sycl::info::device::name>().c_str(), type_name, N,
+         result.baseline_gelem_s, result.binned_gelem_s, slowdown);
+   }
+};
+
+TEST_P(ADNCumsumBench, Throughput_Double_100M) {
+   report<double>("double", 100000000);
+}
+
+TEST_P(ADNCumsumBench, Throughput_Float_100M) {
+   report<float>("float", 100000000);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+   GPUs, ADNCumsumBench, ::testing::ValuesIn(all_gpus()), device_label);
+
+INSTANTIATE_TEST_SUITE_P(
+   CPUs, ADNCumsumBench, ::testing::ValuesIn(all_cpus()), device_label);
+
 // ============================================================
 //  Version macro sanity
 // ============================================================
@@ -2197,7 +2851,7 @@ TEST(Version, MacroEncoding) {
    EXPECT_EQ(SYCL_REPRO_SUM_VERSION,
       SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +
          SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH);
-   EXPECT_GE(SYCL_REPRO_SUM_VERSION, 10000); // at least 1.0.0
+   EXPECT_GE(SYCL_REPRO_SUM_VERSION, 10100); // at least 1.1.0
    EXPECT_EQ(adn::max_reproducible_count<float>, UINT64_C(4294966784));
    EXPECT_EQ(
       adn::max_reproducible_count<double>, UINT64_C(9223372036854773760));
@@ -2243,6 +2897,52 @@ protected:
                << dev.get_info<sycl::info::device::name>() << " produced " << r
                << " but " << ref_name << " produced " << ref;
          }
+      }
+   }
+
+   /// @brief Run cumsum with different work-group sizes on every selected
+   ///        device and compare the complete output arrays bit-for-bit.
+   template <typename T>
+   static void expect_cumsum_identical(const std::vector<T> &input) {
+      auto &devices = all_devices();
+      if (devices.size() < 2) {
+         GTEST_SKIP() << "fewer than two distinct devices available";
+      }
+
+      size_t validated_devices = 0;
+      std::vector<T> reference;
+      std::string reference_name;
+      for (size_t device_index = 0; device_index < devices.size();
+           ++device_index) {
+         const sycl::device &device = devices[device_index];
+         if (!device.has(sycl::aspect::fp64)) {
+            continue;
+         }
+
+         sycl::queue q(device);
+         std::vector<T> output(input.size());
+         if (device_index % 2 == 0) {
+            adn::cumsum<3, 64>(q, input.data(), output.data(), input.size());
+         } else {
+            adn::cumsum<3, 256>(q, input.data(), output.data(), input.size());
+         }
+         EXPECT_BIT_EQ(output.back(), adn::sum(q, input.data(), input.size()));
+         ++validated_devices;
+
+         if (reference.empty()) {
+            reference = output;
+            reference_name = device.get_info<sycl::info::device::name>();
+            continue;
+         }
+
+         const std::string device_name =
+            device.get_info<sycl::info::device::name>();
+         expect_bit_identical_arrays(
+            output, reference, device_name + " vs " + reference_name);
+      }
+
+      if (validated_devices < 2) {
+         GTEST_SKIP() << "fewer than two fp64-capable devices available";
       }
    }
 };
@@ -2310,4 +3010,121 @@ TEST_F(ADNSumCrossDevice, OppositeInfinities) {
    v[17] = std::numeric_limits<double>::infinity();
    v[3073] = -std::numeric_limits<double>::infinity();
    expect_identical(v);
+}
+
+TEST_F(ADNSumCrossDevice, Cumsum_Double) {
+   std::mt19937 gen(29);
+   std::uniform_real_distribution<double> dist(-1e12, 1e12);
+   std::vector<double> input(16387);
+   for (double &x : input) {
+      x = dist(gen);
+   }
+   input[17] = 1e16;
+   input[18] = -1e16;
+   input[2047] = std::numeric_limits<double>::denorm_min();
+   input[2048] = -std::numeric_limits<double>::denorm_min();
+   expect_cumsum_identical(input);
+}
+
+TEST_F(ADNSumCrossDevice, Cumsum_Float) {
+   std::mt19937 gen(31);
+   std::uniform_real_distribution<float> dist(-1e6f, 1e6f);
+   std::vector<float> input(16387);
+   for (float &x : input) {
+      x = dist(gen);
+   }
+   input[7] = 1e30f;
+   input[8] = -1e30f;
+   input[2047] = std::numeric_limits<float>::denorm_min();
+   input[2048] = -std::numeric_limits<float>::denorm_min();
+   expect_cumsum_identical(input);
+}
+
+TEST_F(ADNSumCrossDevice, Cumsum_ShuffledCancellationFullArray) {
+   constexpr size_t N = 2048;
+   constexpr int RUNS = 100;
+   const auto &devices = all_devices();
+   const size_t supported_devices = static_cast<size_t>(std::count_if(
+      devices.begin(), devices.end(), [](const sycl::device &device) {
+      return device.has(sycl::aspect::fp64);
+   }));
+   if (supported_devices < 2) {
+      GTEST_SKIP() << "fewer than two fp64-capable devices available";
+   }
+
+   std::vector<double> input;
+   input.reserve(N);
+   for (size_t i = 0; i < 682; ++i) {
+      input.push_back(1e16);
+      input.push_back(-1e16);
+      input.push_back(1.0);
+   }
+   input.push_back(1.0);
+   input.push_back(1.0);
+   ASSERT_EQ(input.size(), N);
+
+   // Keep the permutation identical across standard-library implementations.
+   std::mt19937 rng(3);
+   for (size_t i = input.size() - 1; i > 0; --i) {
+      const size_t j = static_cast<std::uint64_t>(rng()) % (i + 1);
+      std::swap(input[i], input[j]);
+   }
+
+   std::vector<double> cross_device_reference;
+   std::string reference_name;
+   for (const sycl::device &device : devices) {
+      if (!device.has(sycl::aspect::fp64)) {
+         continue;
+      }
+
+      sycl::queue q(device);
+      const std::string device_name =
+         device.get_info<sycl::info::device::name>();
+      auto device_input = adn::detail::allocate_device_usm<double>(N, q);
+      auto device_output = adn::detail::allocate_device_usm<double>(N, q);
+      q.memcpy(device_input.get(), input.data(), N * sizeof(double))
+         .wait_and_throw();
+
+      adn::cumsum(q, device_input.get(), device_output.get(), N);
+      std::vector<double> device_reference(N);
+      q.memcpy(device_reference.data(), device_output.get(), N * sizeof(double))
+         .wait_and_throw();
+      EXPECT_BIT_EQ(device_reference.back(), 684.0) << device_name;
+      EXPECT_BIT_EQ(device_reference.back(), adn::sum(q, device_input.get(), N))
+         << device_name;
+
+      if (cross_device_reference.empty()) {
+         cross_device_reference = device_reference;
+         reference_name = device_name;
+      } else {
+         expect_bit_identical_arrays(device_reference, cross_device_reference,
+            device_name + " vs " + reference_name);
+      }
+
+      std::vector<double> actual(N);
+      for (int run = 0; run < RUNS; ++run) {
+         switch (run % 4) {
+            case 0:
+               adn::cumsum<3, 64>(
+                  q, device_input.get(), device_output.get(), N);
+               break;
+            case 1:
+               adn::cumsum<3, 128>(
+                  q, device_input.get(), device_output.get(), N);
+               break;
+            case 2:
+               adn::cumsum<3, 256>(
+                  q, device_input.get(), device_output.get(), N);
+               break;
+            default:
+               adn::cumsum<3, 512>(
+                  q, device_input.get(), device_output.get(), N);
+               break;
+         }
+         q.memcpy(actual.data(), device_output.get(), N * sizeof(double))
+            .wait_and_throw();
+         expect_bit_identical_arrays(actual, device_reference,
+            device_name + ", run " + std::to_string(run));
+      }
+   }
 }

@@ -1,25 +1,27 @@
 # SyclReproSum
 
-Bit-reproducible floating-point summation for SYCL - a single header
-implementing the **Ahrens-Demmel-Nguyen (ADN)** *binned floating-point*
-algorithm, with primitives adapted from the
+Bit-reproducible floating-point sums and cumulative sums for SYCL - a single
+header implementing the **Ahrens-Demmel-Nguyen (ADN)** *binned
+floating-point* algorithm, with primitives adapted from the
 [ReproBLAS](https://bebop.cs.berkeley.edu/reproblas/) reference
 implementation.
 
-- **Bit-reproducible** - within the documented accumulator capacity, the sum
+- **Bit-reproducible** - within the documented accumulator capacity, each sum
   is exactly the same bits on every run, for any input order, supported
-  work-group size, or thread scheduling on a validated device.
+  work-group size, or thread scheduling on a validated device. Each cumulative
+  sum has the same guarantee for the values in that prefix.
 - **Cross-device** - validated CPU, NVIDIA GPU, and Intel GPU devices produce
   *identical* results from the same input; this is tested here across CUDA,
   Level-Zero, and OpenCL backends.
-- **Single pass** - no max-scan or second sweep; the accumulation kernel reads
-  the device input once and approaches the plain `sycl::reduction` throughput
-  baseline on the tested NVIDIA GPU.
+- **Efficient algorithms** - `adn::sum` reads the device input once and
+  approaches the plain `sycl::reduction` throughput baseline on the tested
+  NVIDIA GPU. `adn::cumsum` uses a hierarchical binned scan without a
+  full accumulator per output element.
 - **Robust** - Inf/NaN propagate deterministically using a fixed canonical
   quiet NaN, subnormals are handled, and the dominant binned absolute-error
   term at the default K=3 is proportional to N * 2^-80 * max|x| for double.
-- **Easy to adopt** - one header, one function (`adn::sum`), `float`
-  and `double`, C++17.
+- **Easy to adopt** - one header, two functions (`adn::sum` and
+  `adn::cumsum`), `float` and `double`, C++17.
 
 ## Why?
 
@@ -61,9 +63,13 @@ int main() {
       data.push_back(1.0);
    }
 
-   // Single API: accepts device, shared, or host pointers
+   // Scalar reproducible sum: accepts device, shared, or host pointers.
    double result = adn::sum(q, data.data(), data.size());
-   return result == 10000.0 ? 0 : 1;
+
+   // Reproducible cumulative sums. Each output[i] sums data[0..i].
+   std::vector<double> cumulative(data.size());
+   adn::cumsum(q, data.data(), cumulative.data(), data.size());
+   return result == 10000.0 && cumulative.back() == result ? 0 : 1;
 }
 ```
 
@@ -92,16 +98,24 @@ double result = adn::sum<6>(q, ptr, N);
 
 // Custom work-group size:
 double result = adn::sum<3, 512>(q, ptr, N);
+
+// Cumulative sums into a separate output array:
+std::vector<double> output(N);
+adn::cumsum(q, host_ptr, output.data(), N);
+
+// Exact in-place cumulative sum is supported:
+adn::cumsum(q, s_ptr, s_ptr, N);
 ```
 
 ## Performance
 
-Single pass over the data, 100M elements. The values below are the mean
-of three benchmark invocations, each measured as the average of 10 runs
-after one warmup run. Throughput is measured in GElements/s (billions of
-input elements processed per second, where 1 GElements/s = 10^9
-elements/s), so `double` and `float` can be compared without the
-element-size bias of GB/s:
+The throughput benchmarks process 100M elements. The values below are the mean
+of three benchmark invocations, each measured as the average of 10 runs after
+one warmup run. Throughput is measured in GElements/s: billions of input
+elements processed per second, where 1 GElements/s = 10^9 elements/s. This
+lets `double` and `float` be compared without the element-size bias of GB/s.
+
+### Scalar-sum throughput
 
 | Device (backend) | `double` sum / baseline* (GElements/s) | `float` sum / baseline* (GElements/s) |
 |---|---:|---:|
@@ -121,6 +135,23 @@ and runtime effects. The slowdown factor is `baseline / sum`.
 > higher relative overhead on CPU vs GPU is expected: GPUs hide the
 > deposit dependency chain with massive thread-level parallelism, while
 > CPU threads have fewer opportunities to overlap dependent operations.
+
+### Cumulative-sum throughput
+
+The cumulative-sum baseline is oneDPL `inclusive_scan` with a standard device
+policy and `std::plus`. Both algorithms use the same device-USM input and
+output arrays. The baseline is a throughput comparison only and does not
+provide the reproducibility guarantees of `adn::cumsum`.
+
+| Device (backend) | `double` cumsum / baseline* (GElements/s) | `float` cumsum / baseline* (GElements/s) |
+|---|---:|---:|
+| NVIDIA GB10 (CUDA) | pending | pending |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA) | 4.855 / 21.383 (4.4x slower) | 6.696 / 40.480 (6.0x slower) |
+| Intel Graphics [0x7d67] (Level-Zero) | 0.167 / 0.610 (3.7x slower) | 0.331 / 2.445 (7.4x slower) |
+| Intel Core Ultra 7 265 CPU (OpenCL) | 0.118 / 1.490 (12.6x slower) | 0.138 / 2.536 (18.4x slower) |
+
+*Baseline = oneDPL `inclusive_scan` of the same data type on the same device.
+The slowdown factor is `baseline / cumsum`. GB10 measurements are pending.
 
 ### Cross-device reproducibility
 
@@ -152,7 +183,7 @@ values aligned to a fixed, global grid of exponent bins (bin width W = 40
 bits for double, 13 bits for float), plus K carry counters. Within the
 accumulator capacity, every deposit rounds on the same absolute grid, so the
 result is independent of summation order. No max-scan is needed, and the
-accumulation kernel reads each device input element exactly once:
+`adn::sum` accumulation kernel reads each device input element exactly once:
 
 1. **Deposit** - Each work-item strides over the input and adds each
    element to its private accumulator with a few plain FP additions
@@ -165,6 +196,18 @@ accumulation kernel reads each device input element exactly once:
 3. **Merge** - Work-group accumulators are combined with an exact binned
    tree reduction; a final device work-group merges the per-group results
    and converts the total back to a single float/double.
+
+For `adn::cumsum`, contiguous tiles are first reduced to binned totals.
+Those totals undergo a recursive exclusive scan while remaining in binned
+form. A final pass replays each tile from its incoming accumulator and converts
+every prefix to `float` or `double`. Only tile totals and tile prefixes require
+temporary global storage; the implementation does not store a full binned
+accumulator for every output element.
+
+Input order defines prefix membership, so shuffling the input generally
+changes intermediate outputs. For a fixed input sequence, every output is
+bit-identical across supported work-group sizes and validated devices. The
+last output retains the full order-independent `adn::sum` guarantee.
 
 ```
 Deposit of x (double, W=40, K=3), into an accumulator whose bins cover x:
@@ -206,17 +249,28 @@ void validate_environment(sycl::queue &q);
 template <int K = 3, int WG_SIZE = 256, typename T>
 T sum(sycl::queue &q, const T *arr, size_t N);
 
+/// Reproducible cumulative sums of N values.
+/// output[i] is the reproducible sum of input[0] through input[i].
+/// Accepts device, shared, host USM, or plain host pointers independently
+/// for input and output. Plain host input is copied to device and plain host
+/// output is copied back before this synchronous call returns.
+/// Exact in-place operation (input == output) is supported; other overlapping
+/// ranges are not supported.
+template <int K = 3, int WG_SIZE = 256, typename T>
+void cumsum(
+   sycl::queue &q, const T *input, T *output, size_t N);
+
 }
 ```
 
 ### Pointer type handling
 
-| Pointer source | Behavior |
-|----------------|----------|
-| `sycl::malloc_device` | Used directly; no library-side copy |
-| `sycl::malloc_shared` | Used directly; no library-side copy |
-| `sycl::malloc_host` | Used directly; no library-side copy |
-| Plain host pointer (`new`, stack, `std::vector::data()`) | Copied into a temporary device allocation; only the temporary is freed |
+| Pointer source | Input behavior | `cumsum` output behavior |
+|----------------|----------------|-------------------------------|
+| `sycl::malloc_device` | Used directly | Used directly |
+| `sycl::malloc_shared` | Used directly | Used directly |
+| `sycl::malloc_host` | Used directly | Used directly |
+| Plain host pointer | Copied to temporary device storage | Temporary device output is copied back |
 
 Detection is done at runtime via `sycl::get_pointer_type`. "No library-side
 copy" does not guarantee a physical zero-copy implementation; the SYCL
@@ -234,9 +288,9 @@ remaining exact. SyclReproSum uses the conservative capacities from ReproBLAS:
 
 The limit is available to callers as
 `adn::max_reproducible_count<float>` or
-`adn::max_reproducible_count<double>`. `adn::sum` throws
-`std::length_error` before inspecting the pointer or allocating memory when
-`N` exceeds the corresponding limit. Splitting the input and adding the
+`adn::max_reproducible_count<double>`. `adn::sum` and `adn::cumsum`
+throw `std::length_error` before inspecting the pointer or allocating memory
+when `N` exceeds the corresponding limit. Splitting the input and adding the
 scalar chunk results does not preserve the reproducibility guarantee.
 
 ### Template Parameters
@@ -260,11 +314,11 @@ particular device's work-group or local-memory limits at runtime.
 
 ### Runtime environment validation
 
-Every non-empty `adn::sum` call automatically validates the floating-point
-environment before inspecting the input pointer or allocating the main work
-buffer. All final merging and conversion runs on the device, so host rounding
-and denormal modes do not affect the result. Validation is fail-closed and
-covers:
+Every non-empty `adn::sum` or `adn::cumsum` call automatically validates
+the floating-point environment before inspecting the input pointer or
+allocating the main work buffer. All merging and conversion runs on the
+device, so host rounding and denormal modes do not affect the result.
+Validation is fail-closed and covers:
 
 - the IEEE binary32 and binary64 layouts used by the bit-level helpers;
 - device fp64 support, including for float sums whose final conversion uses
@@ -303,8 +357,9 @@ effective device behavior and reject unsafe combinations.
 
 - [Intel DPC++ compiler](https://github.com/intel/llvm)
   (`clang++` with `-fsycl`, C++17 or later)
+- oneDPL headers for the cumulative-sum throughput baseline
 - A SYCL device with fp64 support that passes runtime environment validation
-  (required by both float and double sums)
+  (required by float and double sums and cumulative sums)
 - For GPU: NVIDIA GPU + CUDA toolkit (for `nvptx64` target), and/or Intel
   GPU runtime (for `spir64`)
 - For CPU: Intel OpenCL CPU runtime (`intel-oneapi-runtime-opencl`)
@@ -353,6 +408,9 @@ make DPCPP_HOME=/path/to/sycl_workspace
 
 # Target only NVIDIA GPU
 make SYCL_TARGETS=nvptx64-nvidia-cuda
+
+# Custom oneDPL include directory for the benchmark baseline
+make ONEDPL_INC=/path/to/oneDPL/include
 ```
 
 ## Test Suite
@@ -361,10 +419,10 @@ The Google Test suite chooses one preferred backend per distinct device name
 (Level-Zero, then CUDA, then other backends, with OpenCL as the fallback).
 Each correctness case runs once per selected CPU or GPU from a single fat
 binary (CUDA + SPIR-V), plus cross-device bit-identity tests and throughput
-benchmarks. There are 149 correctness cases and 2 benchmarks per device, plus
-7 cross-device cases and one version test: 461 tests on a system with 2 GPUs +
-1 CPU. The `WG_SIZE=1024` cases skip on a device whose work-group or local
-memory limits cannot support that configuration.
+benchmarks. There are 169 correctness cases and 4 benchmarks per device, plus
+10 cross-device cases and one version test: 530 tests on a system with two
+GPUs and one CPU. The `WG_SIZE=1024` cases skip on a device whose work-group or
+local memory limits cannot support that configuration.
 
 | Category | Description |
 |----------|-------------|
@@ -374,9 +432,10 @@ memory limits cannot support that configuration.
 | Large-scale | 1M to 20M elements, multi-work-group boundaries |
 | Special values | Canonical NaN across payloads/devices, Inf propagation, subnormals, overflow to +Inf |
 | Reproducibility | Multi-run bit-identity, shuffle order-independence, cross-WG_SIZE and selected cross-device/backend consistency |
+| Cumulative sums | Prefix references, three-level tile scan, WG/K matrices, USM bounds, cross-device identity, and repeated-run stress cases |
 | Environment safety | Host FP-mode independence, shared validation, exception-safe USM cleanup, unsafe device mode rejection |
 | Configurations | K = 2, 3, 4, 5, 6, 8, 12; WG_SIZE = 64, 128, 256, 512, 1024; device- and host-pointer APIs |
-| Benchmarks | Throughput measurement on all selected devices (GPU + CPU) |
+| Benchmarks | `adn::sum` and `adn::cumsum` throughput on all selected devices (GPU + CPU) |
 
 ```bash
 # Run the normal suite, including benchmarks
@@ -396,6 +455,10 @@ LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test --gtest_filter="CPUs/*"
 
 # Run only benchmarks
 LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test --gtest_filter="*Bench*"
+
+# Run only cumulative-sum benchmarks
+LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test \
+   --gtest_filter="*ADNCumsumBench*"
 ```
 
 ## References

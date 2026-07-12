@@ -8,8 +8,8 @@
 #pragma once
 /**
  * @file repro_sum.hpp
- * @brief Single-pass reproducible floating-point summation for SYCL GPU,
- *        based on the Ahrens-Demmel-Nguyen (ADN) binned ("indexed")
+ * @brief Reproducible floating-point sums and cumulative sums for SYCL
+ *        devices, based on the Ahrens-Demmel-Nguyen (ADN) binned ("indexed")
  *        floating-point format as implemented by ReproBLAS.
  *
  * Each scalar is deposited into a K-fold *binned accumulator*: K primary
@@ -45,6 +45,12 @@
  *
  *   // Custom work-group size:
  *   double result = adn::sum<3, 512>(queue, d_ptr, N);
+ *
+ *   // Cumulative sums (output[i] sums input[0] through input[i]):
+ *   adn::cumsum(queue, d_ptr, d_output, N);
+ *
+ *   // Exact in-place operation is supported:
+ *   adn::cumsum(queue, d_ptr, d_ptr, N);
  * @endcode
  *
  * @tparam K       Fold count (number of bins held, default 3).
@@ -70,7 +76,7 @@
 /// @endcode
 /// @{
 #define SYCL_REPRO_SUM_VERSION_MAJOR 1
-#define SYCL_REPRO_SUM_VERSION_MINOR 0
+#define SYCL_REPRO_SUM_VERSION_MINOR 1
 #define SYCL_REPRO_SUM_VERSION_PATCH 0
 #define SYCL_REPRO_SUM_VERSION                                                 \
    (SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +                                     \
@@ -803,6 +809,241 @@ T sum_impl(sycl::queue &q, const T *d_arr, size_t N) {
 }
 
 /**
+ * @brief Compute an exclusive scan of binned accumulators.
+ *
+ * Each work-group performs an in-place Blelloch scan in local memory and
+ * writes its total.  Group totals are scanned recursively, then added to the
+ * group-local prefixes.  Keeping the values in binned form avoids an
+ * intermediate floating-point conversion and its associated rounding.
+ *
+ * @p input and @p output must not overlap.  All input accumulators must be
+ * renormalized.  The function is synchronous so its temporary device
+ * allocations remain alive until the submitted kernels complete.
+ */
+template <typename T, int K, int WG_SIZE>
+void binned_exclusive_scan(
+   sycl::queue &q, const Binned<T, K> *input, Binned<T, K> *output, size_t N) {
+   using Acc = Binned<T, K>;
+
+   if (N == 0) {
+      return;
+   }
+
+   const size_t num_groups = (N + WG_SIZE - 1) / WG_SIZE;
+   auto totals_owner = allocate_device_usm<Acc>(num_groups, q);
+   Acc *totals = totals_owner.get();
+
+   q.submit([&](sycl::handler &h) {
+      sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
+
+      auto scan_groups = [=](sycl::nd_item<1> item) {
+         const size_t gid = item.get_global_id(0);
+         const size_t group = item.get_group(0);
+         const size_t lid = item.get_local_id(0);
+
+         loc[lid] = gid < N ? input[gid] : Acc{};
+         sycl::group_barrier(item.get_group());
+
+         for (size_t offset = 1; offset < WG_SIZE; offset <<= 1) {
+            const size_t index = (lid + 1) * (offset << 1) - 1;
+            if (index < WG_SIZE) {
+               Acc lhs = loc[index - offset];
+               merge(lhs, loc[index]);
+               loc[index] = lhs;
+            }
+            sycl::group_barrier(item.get_group());
+         }
+
+         if (lid == 0) {
+            totals[group] = loc[WG_SIZE - 1];
+            loc[WG_SIZE - 1] = Acc{};
+         }
+         sycl::group_barrier(item.get_group());
+
+         for (size_t offset = WG_SIZE / 2; offset > 0; offset >>= 1) {
+            const size_t index = (lid + 1) * (offset << 1) - 1;
+            if (index < WG_SIZE) {
+               const Acc left = loc[index - offset];
+               Acc prefix = loc[index];
+               loc[index - offset] = prefix;
+               merge(prefix, left);
+               loc[index] = prefix;
+            }
+            sycl::group_barrier(item.get_group());
+         }
+
+         if (gid < N) {
+            output[gid] = loc[lid];
+         }
+      };
+
+      h.parallel_for(
+         sycl::nd_range<1>(num_groups * WG_SIZE, WG_SIZE), scan_groups);
+   }).wait_and_throw();
+
+   if (num_groups == 1) {
+      return;
+   }
+
+   auto prefixes_owner = allocate_device_usm<Acc>(num_groups, q);
+   Acc *prefixes = prefixes_owner.get();
+   binned_exclusive_scan<T, K, WG_SIZE>(q, totals, prefixes, num_groups);
+
+   q.submit([&](sycl::handler &h) {
+      auto add_group_prefix = [=](sycl::id<1> id) {
+         const size_t i = id[0];
+         Acc prefix = prefixes[i / WG_SIZE];
+         merge(prefix, output[i]);
+         output[i] = prefix;
+      };
+
+      h.parallel_for(sycl::range<1>(N), add_group_prefix);
+   }).wait_and_throw();
+}
+
+/**
+ * @brief Device implementation of reproducible cumulative sums.
+ *
+ * A tile contains a short contiguous segment per work-item.  The first pass
+ * computes one binned total per tile.  Those totals are scanned without
+ * converting them to scalar floating point.  The final pass replays each
+ * tile from its incoming binned prefix and converts every element prefix.
+ * This keeps temporary storage proportional to the number of tiles instead
+ * of storing a full binned accumulator for every output element.
+ */
+template <typename T, int K, int WG_SIZE>
+void cumsum_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N) {
+   SYCL_REPRO_SUM_DETAIL_STRICT_FP
+   using Acc = Binned<T, K>;
+
+   constexpr size_t ITEMS_PER_WORK_ITEM = 8;
+   constexpr size_t TILE_SIZE = size_t(WG_SIZE) * ITEMS_PER_WORK_ITEM;
+   const size_t num_tiles = (N + TILE_SIZE - 1) / TILE_SIZE;
+
+   auto totals_owner = allocate_device_usm<Acc>(num_tiles, q);
+   auto prefixes_owner = allocate_device_usm<Acc>(num_tiles, q);
+   Acc *tile_totals = totals_owner.get();
+   Acc *tile_prefixes = prefixes_owner.get();
+
+   q.submit([&](sycl::handler &h) {
+      sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
+
+      auto compute_tile_totals = [=](sycl::nd_item<1> item) {
+         const size_t tile = item.get_group(0);
+         const size_t lid = item.get_local_id(0);
+         const size_t begin = tile * TILE_SIZE + lid * ITEMS_PER_WORK_ITEM;
+
+         Acc acc{};
+         int e_threshold = -1;
+         int since_renorm = 0;
+         for (size_t j = 0; j < ITEMS_PER_WORK_ITEM; ++j) {
+            const size_t i = begin + j;
+            if (i < N) {
+               accumulate(acc, e_threshold, since_renorm, d_input[i]);
+            }
+         }
+         renorm(acc);
+
+         loc[lid] = acc;
+         sycl::group_barrier(item.get_group());
+
+         for (size_t offset = WG_SIZE / 2; offset > 0; offset >>= 1) {
+            if (lid < offset) {
+               Acc lhs = loc[lid];
+               merge(lhs, loc[lid + offset]);
+               loc[lid] = lhs;
+            }
+            sycl::group_barrier(item.get_group());
+         }
+
+         if (lid == 0) {
+            tile_totals[tile] = loc[0];
+         }
+      };
+
+      h.parallel_for(
+         sycl::nd_range<1>(num_tiles * WG_SIZE, WG_SIZE), compute_tile_totals);
+   }).wait_and_throw();
+
+   binned_exclusive_scan<T, K, WG_SIZE>(
+      q, tile_totals, tile_prefixes, num_tiles);
+
+   q.submit([&](sycl::handler &h) {
+      sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
+
+      auto write_prefixes = [=](sycl::nd_item<1> item) {
+         const size_t tile = item.get_group(0);
+         const size_t lid = item.get_local_id(0);
+         const size_t begin = tile * TILE_SIZE + lid * ITEMS_PER_WORK_ITEM;
+
+         Acc chunk{};
+         int chunk_threshold = -1;
+         int chunk_since_renorm = 0;
+         for (size_t j = 0; j < ITEMS_PER_WORK_ITEM; ++j) {
+            const size_t i = begin + j;
+            if (i < N) {
+               accumulate(
+                  chunk, chunk_threshold, chunk_since_renorm, d_input[i]);
+            }
+         }
+         renorm(chunk);
+
+         loc[lid] = chunk;
+         sycl::group_barrier(item.get_group());
+
+         for (size_t offset = 1; offset < WG_SIZE; offset <<= 1) {
+            const size_t index = (lid + 1) * (offset << 1) - 1;
+            if (index < WG_SIZE) {
+               Acc lhs = loc[index - offset];
+               merge(lhs, loc[index]);
+               loc[index] = lhs;
+            }
+            sycl::group_barrier(item.get_group());
+         }
+
+         if (lid == 0) {
+            loc[WG_SIZE - 1] = Acc{};
+         }
+         sycl::group_barrier(item.get_group());
+
+         for (size_t offset = WG_SIZE / 2; offset > 0; offset >>= 1) {
+            const size_t index = (lid + 1) * (offset << 1) - 1;
+            if (index < WG_SIZE) {
+               const Acc left = loc[index - offset];
+               Acc prefix = loc[index];
+               loc[index - offset] = prefix;
+               merge(prefix, left);
+               loc[index] = prefix;
+            }
+            sycl::group_barrier(item.get_group());
+         }
+
+         Acc prefix = tile_prefixes[tile];
+         merge(prefix, loc[lid]);
+         int e_threshold = -1;
+         if (prefix.pri[0] != T(0)) {
+            e_threshold = fp<T>::max_exp + fp<T>::exp_bias -
+               accum_index(prefix) * fp<T>::bin_width;
+         }
+         int since_renorm = 0;
+
+         for (size_t j = 0; j < ITEMS_PER_WORK_ITEM; ++j) {
+            const size_t i = begin + j;
+            if (i < N) {
+               accumulate(prefix, e_threshold, since_renorm, d_input[i]);
+               Acc normalized = prefix;
+               renorm(normalized);
+               d_output[i] = conv(normalized);
+            }
+         }
+      };
+
+      h.parallel_for(
+         sycl::nd_range<1>(num_tiles * WG_SIZE, WG_SIZE), write_prefixes);
+   }).wait_and_throw();
+}
+
+/**
  * @brief Runtime values and results for the device floating-point probe.
  */
 template <typename T> struct EnvironmentProbeData {
@@ -1105,6 +1346,102 @@ T sum(sycl::queue &q, const T *arr, size_t N) {
    T *d_arr = device_owner.get();
    q.memcpy(d_arr, arr, N * sizeof(T)).wait_and_throw();
    return detail::sum_impl<T, K, WG_SIZE>(q, d_arr, N);
+}
+
+/**
+ * @brief Compute bit-reproducible cumulative sums.
+ *
+ * For every valid index @p i, the output is the reproducible sum of
+ * `input[0]` through `input[i]`.  Each output is independent of work-item
+ * execution order, work-group size, and device within the documented
+ * accumulator capacity.  The input order still defines which values belong
+ * to each prefix.
+ *
+ * @tparam K       Fold count (default 3).  More folds improve accuracy.
+ * @tparam WG_SIZE Work-group size (default 256).
+ * @tparam T       Floating-point type (deduced from the pointers).
+ * @param  q       SYCL queue bound to the target device.
+ * @param  input   Input array.  Accepts device, shared, host USM, or a plain
+ *                 host pointer.
+ * @param  output  Output array of at least @p N elements.  It may equal
+ *                 @p input for an in-place cumulative sum.  Other overlapping
+ *                 input and output ranges are not supported.
+ * @param  N       Number of input and output elements.
+ * @throws std::invalid_argument if a nonempty input or output is null.
+ * @throws std::length_error if @p N exceeds the reproducible capacity or its
+ *                           byte size cannot be represented by `size_t`.
+ * @throws std::runtime_error if the device lacks the required IEEE 754
+ *                             floating-point semantics.
+ *
+ * @note This operation is synchronous.  Plain host input is copied to a
+ *       temporary device allocation and plain host output is copied back
+ *       before the function returns.
+ *
+ * @note Both float and double cumulative sums require fp64 support because
+ *       float conversion accumulates in double precision.
+ */
+template <int K = 3, int WG_SIZE = 256, typename T>
+void cumsum(sycl::queue &q, const T *input, T *output, size_t N) {
+   validate_params<T, K, WG_SIZE>();
+   if (N == 0) {
+      return;
+   }
+   if (N > max_reproducible_count<T>) {
+      throw std::length_error(
+         "adn::cumsum input count exceeds max_reproducible_count<T>");
+   }
+   if (N > std::numeric_limits<size_t>::max() / sizeof(T)) {
+      throw std::length_error("adn::cumsum byte size overflows size_t");
+   }
+   if (input == nullptr || output == nullptr) {
+      throw std::invalid_argument(
+         "adn::cumsum requires non-null pointers when N is nonzero");
+   }
+   validate_environment<T>(q);
+
+   const auto input_type = sycl::get_pointer_type(input, q.get_context());
+   const auto output_type = sycl::get_pointer_type(output, q.get_context());
+   const bool input_is_usm = input_type != sycl::usm::alloc::unknown;
+   const bool output_is_usm = output_type != sycl::usm::alloc::unknown;
+   const size_t bytes = N * sizeof(T);
+
+   if (input_is_usm && output_is_usm) {
+      detail::cumsum_impl<T, K, WG_SIZE>(q, input, output, N);
+      return;
+   }
+
+   if (input == output) {
+      auto device_owner = detail::allocate_device_usm<T>(N, q);
+      T *device_data = device_owner.get();
+      q.memcpy(device_data, input, bytes).wait_and_throw();
+      detail::cumsum_impl<T, K, WG_SIZE>(q, device_data, device_data, N);
+      q.memcpy(output, device_data, bytes).wait_and_throw();
+      return;
+   }
+
+   detail::UsmUniquePtr<T> input_owner(
+      nullptr, detail::UsmDeleter<T>{q.get_context()});
+   detail::UsmUniquePtr<T> output_owner(
+      nullptr, detail::UsmDeleter<T>{q.get_context()});
+
+   const T *device_input = input;
+   if (!input_is_usm) {
+      input_owner = detail::allocate_device_usm<T>(N, q);
+      device_input = input_owner.get();
+      q.memcpy(input_owner.get(), input, bytes).wait_and_throw();
+   }
+
+   T *device_output = output;
+   if (!output_is_usm) {
+      output_owner = detail::allocate_device_usm<T>(N, q);
+      device_output = output_owner.get();
+   }
+
+   detail::cumsum_impl<T, K, WG_SIZE>(q, device_input, device_output, N);
+
+   if (!output_is_usm) {
+      q.memcpy(output, output_owner.get(), bytes).wait_and_throw();
+   }
 }
 
 } // namespace adn
