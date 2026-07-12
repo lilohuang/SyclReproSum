@@ -145,13 +145,13 @@ provide the reproducibility guarantees of `adn::cumsum`.
 
 | Device (backend) | `double` cumsum / baseline* (GElements/s) | `float` cumsum / baseline* (GElements/s) |
 |---|---:|---:|
-| NVIDIA GB10 (CUDA) | pending | pending |
+| NVIDIA GB10 (CUDA) | 2.364 / 7.606 (3.2x slower) | 3.413 / 14.980 (4.4x slower) |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | 4.855 / 21.383 (4.4x slower) | 6.696 / 40.480 (6.0x slower) |
 | Intel Graphics [0x7d67] (Level-Zero) | 0.167 / 0.610 (3.7x slower) | 0.331 / 2.445 (7.4x slower) |
 | Intel Core Ultra 7 265 CPU (OpenCL) | 0.118 / 1.490 (12.6x slower) | 0.138 / 2.536 (18.4x slower) |
 
 *Baseline = oneDPL `inclusive_scan` of the same data type on the same device.
-The slowdown factor is `baseline / cumsum`. GB10 measurements are pending.
+The slowdown factor is `baseline / cumsum`.
 
 ### Cross-device reproducibility
 
