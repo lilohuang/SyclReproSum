@@ -83,6 +83,10 @@ double *d_ptr = sycl::malloc_device<double>(N, q);
 q.memcpy(d_ptr, host_ptr, N * sizeof(double)).wait();
 double result = adn::sum(q, d_ptr, N);
 
+// A producer event can be passed without a host-side wait:
+sycl::event input_ready = q.memcpy(d_ptr, host_ptr, N * sizeof(double));
+double dependent_result = adn::sum(q, d_ptr, N, {input_ready});
+
 // Host pointer (auto-copied to device):
 double result = adn::sum(q, host_ptr, N);
 
@@ -235,7 +239,7 @@ namespace adn {
 template <typename T>
 inline constexpr std::uint64_t max_reproducible_count = /* ... */;
 
-/// Validate the queue's device floating-point environment.
+/// Validate the queue's device floating-point environment and shared USM.
 template <typename T>
 void validate_environment(sycl::queue &q);
 
@@ -249,6 +253,11 @@ void validate_environment(sycl::queue &q);
 template <int K = 3, int WG_SIZE = 256, typename T>
 T sum(sycl::queue &q, const T *arr, size_t N);
 
+/// The dependency events complete before the library accesses arr.
+template <int K = 3, int WG_SIZE = 256, typename T>
+T sum(sycl::queue &q, const T *arr, size_t N,
+   const std::vector<sycl::event> &dependencies);
+
 /// Reproducible cumulative sums of N values.
 /// output[i] is the reproducible sum of input[0] through input[i].
 /// Accepts device, shared, host USM, or plain host pointers independently
@@ -259,6 +268,11 @@ T sum(sycl::queue &q, const T *arr, size_t N);
 template <int K = 3, int WG_SIZE = 256, typename T>
 void cumsum(
    sycl::queue &q, const T *input, T *output, size_t N);
+
+/// The dependency events complete before the library accesses either range.
+template <int K = 3, int WG_SIZE = 256, typename T>
+void cumsum(sycl::queue &q, const T *input, T *output, size_t N,
+   const std::vector<sycl::event> &dependencies);
 
 }
 ```
@@ -275,6 +289,19 @@ void cumsum(
 Detection is done at runtime via `sycl::get_pointer_type`. "No library-side
 copy" does not guarantee a physical zero-copy implementation; the SYCL
 runtime may migrate or otherwise manage USM storage.
+
+Every valid, nonempty operation requires shared USM for internal accumulators.
+`adn::cumsum` also requires device USM for its temporary arrays, while
+`adn::sum` requires device USM only when copying a plain host pointer. The
+library checks these capabilities and throws `std::runtime_error` with the
+missing requirement instead of relying on an allocation failure.
+
+For overloads without an explicit dependency list, the caller must ensure
+that prior operations writing a USM input, or otherwise conflicting with a
+USM input or output, have completed before the call.  The dependency overloads
+accept events from those operations and order the first library access after
+them.  Both overload forms are synchronous and return only after all work
+submitted by the library has completed.
 
 ### Accumulator capacity
 
@@ -314,15 +341,19 @@ particular device's work-group or local-memory limits at runtime.
 
 ### Runtime environment validation
 
-Every non-empty `adn::sum` or `adn::cumsum` call automatically validates
-the floating-point environment before inspecting the input pointer or
-allocating the main work buffer. All merging and conversion runs on the
+After input sizes and pointers have been checked, every non-empty `adn::sum`
+or `adn::cumsum` call automatically validates shared USM and the
+floating-point environment before classifying the pointer or allocating the
+main work buffer. Path-specific device USM support is checked before the
+corresponding temporary allocation. All merging and conversion runs on the
 device, so host rounding and denormal modes do not affect the result.
 Validation is fail-closed and covers:
 
 - the IEEE binary32 and binary64 layouts used by the bit-level helpers;
 - device fp64 support, including for float sums whose final conversion uses
   double arithmetic;
+- shared USM support for all nonempty calls, plus device USM support for
+  cumulative sums and plain-host-pointer sums;
 - SYCL round-to-nearest, denormal, and Inf/NaN capability declarations for
   every precision used;
 - effective device arithmetic using runtime-loaded rounding, subnormal, and
@@ -360,6 +391,8 @@ effective device behavior and reject unsafe combinations.
 - oneDPL headers for the cumulative-sum throughput baseline
 - A SYCL device with fp64 support that passes runtime environment validation
   (required by float and double sums and cumulative sums)
+- Shared USM support, plus device USM support for cumulative sums and sums of
+  plain host arrays
 - For GPU: NVIDIA GPU + CUDA toolkit (for `nvptx64` target), and/or Intel
   GPU runtime (for `spir64`)
 - For CPU: Intel OpenCL CPU runtime (`intel-oneapi-runtime-opencl`)
@@ -419,21 +452,21 @@ The Google Test suite chooses one preferred backend per distinct device name
 (Level-Zero, then CUDA, then other backends, with OpenCL as the fallback).
 Each correctness case runs once per selected CPU or GPU from a single fat
 binary (CUDA + SPIR-V), plus cross-device bit-identity tests and throughput
-benchmarks. There are 169 correctness cases and 4 benchmarks per device, plus
-10 cross-device cases and one version test: 530 tests on a system with two
+benchmarks. There are 173 correctness cases and 4 benchmarks per device, plus
+10 cross-device cases and one version test: 542 tests on a system with two
 GPUs and one CPU. The `WG_SIZE=1024` cases skip on a device whose work-group or
 local memory limits cannot support that configuration.
 
 | Category | Description |
 |----------|-------------|
-| Edge cases | Empty, single element, all zeros, negative zero, min/max values |
+| Edge cases | Empty, invalid pointers and sizes, single element, all zeros, negative zero, min/max values |
 | Exact arithmetic | Integer sums, powers of two, geometric series, telescope sums |
 | Cancellation stress | Multi-order cancellation, Kahan worst case, near-overflow cancellation |
 | Large-scale | 1M to 20M elements, multi-work-group boundaries |
 | Special values | Canonical NaN across payloads/devices, Inf propagation, subnormals, overflow to +Inf |
 | Reproducibility | Multi-run bit-identity, shuffle order-independence, cross-WG_SIZE and selected cross-device/backend consistency |
 | Cumulative sums | Prefix references, three-level tile scan, WG/K matrices, USM bounds, cross-device identity, and repeated-run stress cases |
-| Environment safety | Host FP-mode independence, shared validation, exception-safe USM cleanup, unsafe device mode rejection |
+| Environment safety | Host FP-mode independence, USM capability checks, shared validation, exception-safe USM cleanup, unsafe device mode rejection |
 | Configurations | K = 2, 3, 4, 5, 6, 8, 12; WG_SIZE = 64, 128, 256, 512, 1024; device- and host-pointer APIs |
 | Benchmarks | `adn::sum` and `adn::cumsum` throughput on all selected devices (GPU + CPU) |
 

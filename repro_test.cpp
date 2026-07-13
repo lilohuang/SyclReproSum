@@ -29,9 +29,11 @@
 #include <random>
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <functional>
+#include <future>
 
 #if defined(__SSE__)
 #include <xmmintrin.h>
@@ -264,9 +266,12 @@ INSTANTIATE_TEST_SUITE_P(
 //  Double-precision edge cases
 // ============================================================
 
-TEST_P(ADNSumTest, EmptyArray) {
+TEST_P(ADNSumTest, Sum_EmptyAndInvalidPointer) {
    std::vector<double> v;
    EXPECT_EQ(adn::sum(queue(), v.data(), v.size()), 0.0);
+   EXPECT_EQ(adn::sum(queue(), static_cast<const double *>(nullptr), 0), 0.0);
+   EXPECT_THROW(adn::sum(queue(), static_cast<const double *>(nullptr), 1),
+      std::invalid_argument);
 }
 
 TEST_P(ADNSumTest, CapacityExceededRejected) {
@@ -279,6 +284,32 @@ TEST_P(ADNSumTest, CapacityExceededRejected) {
    }
 }
 
+TEST_P(ADNSumTest, Sum_ByteSizeOverflowRejected) {
+   double value = 1.0;
+   const size_t overflowing_count =
+      std::numeric_limits<size_t>::max() / sizeof(double) + 1;
+   EXPECT_THROW(
+      adn::sum(queue(), &value, overflowing_count), std::length_error);
+}
+
+TEST_P(ADNSumTest, USMCapabilitiesValidated) {
+   const sycl::device &device = queue().get_device();
+
+   if (device.has(sycl::aspect::usm_shared_allocations)) {
+      EXPECT_NO_THROW(adn::detail::validate_shared_usm_capability(device));
+   } else {
+      EXPECT_THROW(adn::detail::validate_shared_usm_capability(device),
+         std::runtime_error);
+   }
+
+   if (device.has(sycl::aspect::usm_device_allocations)) {
+      EXPECT_NO_THROW(adn::detail::validate_device_usm_capability(device));
+   } else {
+      EXPECT_THROW(adn::detail::validate_device_usm_capability(device),
+         std::runtime_error);
+   }
+}
+
 TEST_P(ADNSumTest, DeviceEnvironmentValidated) {
    const sycl::device &device = queue().get_device();
    const std::string name = device.get_info<sycl::info::device::name>();
@@ -286,7 +317,8 @@ TEST_P(ADNSumTest, DeviceEnvironmentValidated) {
       EXPECT_EQ(queue().get_backend(), sycl::backend::ext_oneapi_level_zero);
    }
 
-   if (!device.has(sycl::aspect::fp64)) {
+   if (!device.has(sycl::aspect::fp64) ||
+      !device.has(sycl::aspect::usm_shared_allocations)) {
       EXPECT_THROW(
          adn::validate_environment<float>(queue()), std::runtime_error);
       EXPECT_THROW(
@@ -1134,6 +1166,59 @@ TEST_P(ADNSumTest, DevicePointer_LargeArray) {
    EXPECT_EQ(result, static_cast<double>(N));
 
    sycl::free(d_arr, queue());
+}
+
+TEST_P(ADNSumTest, Sum_USMDependencies) {
+   sycl::queue &q = queue();
+   if (!q.get_device().has(sycl::aspect::usm_shared_allocations)) {
+      GTEST_SKIP() << "Device does not support shared USM";
+   }
+
+   constexpr size_t N = 257;
+   auto input_owner = adn::detail::allocate_shared_usm<double>(N, q);
+   double *input = input_owner.get();
+   std::fill(input, input + N, 0.0);
+
+   const std::vector<sycl::event> no_dependencies;
+   EXPECT_EQ(adn::sum(q, input, N, no_dependencies), 0.0);
+
+   sycl::queue producer_queue(q.get_context(), q.get_device());
+   auto started = std::make_shared<std::promise<void>>();
+   auto release = std::make_shared<std::promise<void>>();
+   std::future<void> started_future = started->get_future();
+   std::shared_future<void> release_future = release->get_future().share();
+
+   sycl::event producer = producer_queue.submit([=](sycl::handler &h) {
+      h.host_task([=] {
+         started->set_value();
+         release_future.wait();
+         for (size_t i = 0; i < N; ++i) {
+            input[i] = 1.0;
+         }
+      });
+   });
+
+   if (started_future.wait_for(std::chrono::seconds(5)) !=
+      std::future_status::ready) {
+      release->set_value();
+      producer.wait_and_throw();
+      FAIL() << "Timed out waiting for the producer host task";
+   }
+
+   const std::vector<sycl::event> dependencies{producer};
+   std::packaged_task<double()> call(
+      [&] { return adn::sum(q, input, N, dependencies); });
+   std::future<double> result = call.get_future();
+   std::thread caller(std::move(call));
+
+   EXPECT_EQ(result.wait_for(std::chrono::milliseconds(100)),
+      std::future_status::timeout);
+   release->set_value();
+   caller.join();
+
+   ASSERT_EQ(
+      result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+   EXPECT_EQ(result.get(), static_cast<double>(N));
 }
 
 // ============================================================
@@ -2325,6 +2410,67 @@ TEST_P(ADNSumTest, Cumsum_DeviceUSMAndInPlace) {
    }
 }
 
+TEST_P(ADNSumTest, Cumsum_USMDependencies) {
+   sycl::queue &q = queue();
+   if (!q.get_device().has(sycl::aspect::usm_shared_allocations)) {
+      GTEST_SKIP() << "Device does not support shared USM";
+   }
+
+   constexpr size_t N = 513;
+   auto input_owner = adn::detail::allocate_shared_usm<float>(N, q);
+   auto output_owner = adn::detail::allocate_shared_usm<float>(N, q);
+   float *input = input_owner.get();
+   float *output = output_owner.get();
+   std::fill(input, input + N, 0.0f);
+   std::fill(output, output + N, -1.0f);
+
+   const std::vector<sycl::event> no_dependencies;
+   adn::cumsum(q, input, output, N, no_dependencies);
+   EXPECT_EQ(output[N - 1], 0.0f);
+
+   sycl::queue producer_queue(q.get_context(), q.get_device());
+   auto started = std::make_shared<std::promise<void>>();
+   auto release = std::make_shared<std::promise<void>>();
+   std::future<void> started_future = started->get_future();
+   std::shared_future<void> release_future = release->get_future().share();
+
+   sycl::event producer = producer_queue.submit([=](sycl::handler &h) {
+      h.host_task([=] {
+         started->set_value();
+         release_future.wait();
+         for (size_t i = 0; i < N; ++i) {
+            input[i] = 1.0f;
+            output[i] = -1.0f;
+         }
+      });
+   });
+
+   if (started_future.wait_for(std::chrono::seconds(5)) !=
+      std::future_status::ready) {
+      release->set_value();
+      producer.wait_and_throw();
+      FAIL() << "Timed out waiting for the producer host task";
+   }
+
+   const std::vector<sycl::event> dependencies{producer};
+   std::packaged_task<void()> call(
+      [&] { adn::cumsum(q, input, output, N, dependencies); });
+   std::future<void> result = call.get_future();
+   std::thread caller(std::move(call));
+
+   EXPECT_EQ(result.wait_for(std::chrono::milliseconds(100)),
+      std::future_status::timeout);
+   release->set_value();
+   caller.join();
+
+   ASSERT_EQ(
+      result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+   result.get();
+   for (size_t i = 0; i < N; ++i) {
+      EXPECT_EQ(output[i], static_cast<float>(i + 1)) << "prefix " << i;
+   }
+}
+
 TEST_P(ADNSumTest, Cumsum_MixedHostAndDevicePointers) {
    constexpr size_t N = 2051;
    std::vector<double> input(N);
@@ -2851,7 +2997,7 @@ TEST(Version, MacroEncoding) {
    EXPECT_EQ(SYCL_REPRO_SUM_VERSION,
       SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +
          SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH);
-   EXPECT_GE(SYCL_REPRO_SUM_VERSION, 10100); // at least 1.1.0
+   EXPECT_GE(SYCL_REPRO_SUM_VERSION, 10200); // at least 1.2.0
    EXPECT_EQ(adn::max_reproducible_count<float>, UINT64_C(4294966784));
    EXPECT_EQ(
       adn::max_reproducible_count<double>, UINT64_C(9223372036854773760));

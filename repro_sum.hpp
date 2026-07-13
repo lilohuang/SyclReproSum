@@ -76,7 +76,7 @@
 /// @endcode
 /// @{
 #define SYCL_REPRO_SUM_VERSION_MAJOR 1
-#define SYCL_REPRO_SUM_VERSION_MINOR 1
+#define SYCL_REPRO_SUM_VERSION_MINOR 2
 #define SYCL_REPRO_SUM_VERSION_PATCH 0
 #define SYCL_REPRO_SUM_VERSION                                                 \
    (SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +                                     \
@@ -195,10 +195,31 @@ template <typename T> struct UsmDeleter {
 template <typename T> using UsmUniquePtr = std::unique_ptr<T, UsmDeleter<T>>;
 
 /**
+ * @brief Reject a device that cannot provide shared USM allocations.
+ */
+inline void validate_shared_usm_capability(const sycl::device &device) {
+   if (!device.has(sycl::aspect::usm_shared_allocations)) {
+      throw std::runtime_error(
+         "SyclReproSum requires shared USM allocation support");
+   }
+}
+
+/**
+ * @brief Reject a device that cannot provide device USM allocations.
+ */
+inline void validate_device_usm_capability(const sycl::device &device) {
+   if (!device.has(sycl::aspect::usm_device_allocations)) {
+      throw std::runtime_error(
+         "SyclReproSum requires device USM allocation support");
+   }
+}
+
+/**
  * @brief Allocate shared USM and immediately transfer it to an RAII owner.
  */
 template <typename T>
 inline UsmUniquePtr<T> allocate_shared_usm(size_t count, sycl::queue &q) {
+   validate_shared_usm_capability(q.get_device());
    UsmUniquePtr<T> owner(nullptr, UsmDeleter<T>{q.get_context()});
    T *ptr = sycl::malloc_shared<T>(count, q);
    if (ptr == nullptr) {
@@ -213,6 +234,7 @@ inline UsmUniquePtr<T> allocate_shared_usm(size_t count, sycl::queue &q) {
  */
 template <typename T>
 inline UsmUniquePtr<T> allocate_device_usm(size_t count, sycl::queue &q) {
+   validate_device_usm_capability(q.get_device());
    UsmUniquePtr<T> owner(nullptr, UsmDeleter<T>{q.get_context()});
    T *ptr = sycl::malloc_device<T>(count, q);
    if (ptr == nullptr) {
@@ -714,7 +736,8 @@ inline sycl::event submit_or_wait_on_error(
  * @return         The reproducible sum.
  */
 template <typename T, int K, int WG_SIZE>
-T sum_impl(sycl::queue &q, const T *d_arr, size_t N) {
+T sum_impl(sycl::queue &q, const T *d_arr, size_t N,
+   const std::vector<sycl::event> &dependencies) {
    SYCL_REPRO_SUM_DETAIL_STRICT_FP
    using Acc = Binned<T, K>;
 
@@ -727,6 +750,9 @@ T sum_impl(sycl::queue &q, const T *d_arr, size_t N) {
    Acc *d_partial = partial_owner.get();
 
    sycl::event partials_ready = q.submit([&](sycl::handler &h) {
+      if (!dependencies.empty()) {
+         h.depends_on(dependencies);
+      }
       sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
 
       auto accumulate_partial = [=](sycl::nd_item<1> item) {
@@ -912,7 +938,8 @@ void binned_exclusive_scan(
  * of storing a full binned accumulator for every output element.
  */
 template <typename T, int K, int WG_SIZE>
-void cumsum_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N) {
+void cumsum_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N,
+   const std::vector<sycl::event> &dependencies) {
    SYCL_REPRO_SUM_DETAIL_STRICT_FP
    using Acc = Binned<T, K>;
 
@@ -926,6 +953,9 @@ void cumsum_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N) {
    Acc *tile_prefixes = prefixes_owner.get();
 
    q.submit([&](sycl::handler &h) {
+      if (!dependencies.empty()) {
+         h.depends_on(dependencies);
+      }
       sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
 
       auto compute_tile_totals = [=](sycl::nd_item<1> item) {
@@ -1077,6 +1107,8 @@ inline bool has_fp_config(const std::vector<sycl::info::fp_config> &config,
  */
 template <typename T>
 inline void validate_device_capabilities(const sycl::device &device) {
+   validate_shared_usm_capability(device);
+
    if constexpr (std::is_same_v<T, double>) {
       if (!device.has(sycl::aspect::fp64)) {
          throw std::runtime_error(
@@ -1248,7 +1280,7 @@ inline constexpr std::uint64_t max_reproducible_count = [] {
 }();
 
 /**
- * @brief Validate the device floating-point environment.
+ * @brief Validate the device floating-point environment and shared USM.
  *
  * A successful check is shared by all host threads and cached per backend,
  * device, and floating-point type.  Float sums also validate double precision
@@ -1256,7 +1288,8 @@ inline constexpr std::uint64_t max_reproducible_count = [] {
  *
  * @tparam T Floating-point type (`float` or `double`).
  * @param q  SYCL queue bound to the target device.
- * @throws std::runtime_error if the required IEEE 754 semantics are absent.
+ * @throws std::runtime_error if the required IEEE 754 semantics or shared USM
+ *                            support are absent.
  */
 template <typename T> void validate_environment(sycl::queue &q) {
    detail::validate_fp_type<T>();
@@ -1305,14 +1338,22 @@ template <typename T, int K, int WG_SIZE> constexpr void validate_params() {
  *                 host USM, or plain host pointers.  Plain host pointers
  *                 are automatically copied to device memory.
  * @param  N       Number of elements.
+ * @param  dependencies Events that must complete before the library accesses
+ *                 the input range.
  * @return         Bit-reproducible sum regardless of execution order within
  *                 the documented accumulator capacity.
- * @throws std::length_error if @p N exceeds @ref max_reproducible_count.
+ * @throws std::invalid_argument if a nonempty input is null.
+ * @throws std::length_error if @p N exceeds @ref max_reproducible_count or
+ *                           its byte size cannot be represented by `size_t`.
  * @throws std::runtime_error if the device lacks the required IEEE 754
- *                             floating-point semantics.
+ *                             floating-point semantics or USM support.
  *
  * @note Both float and double sums require device fp64 support because the
  *       final float conversion accumulates in double precision.
+ *
+ * @note Every nonempty sum requires shared USM support for internal
+ *       accumulators.  Plain host pointers additionally require device USM
+ *       support for the temporary input allocation.
  *
  * @note NaN inputs and sums containing both +Inf and -Inf return a fixed
  *       positive quiet NaN (0x7fc00000 for float, 0x7ff8000000000000 for
@@ -1323,7 +1364,8 @@ template <typename T, int K, int WG_SIZE> constexpr void validate_params() {
  *       away deterministically, per the ADN accuracy bound.
  */
 template <int K = 3, int WG_SIZE = 256, typename T>
-T sum(sycl::queue &q, const T *arr, size_t N) {
+T sum(sycl::queue &q, const T *arr, size_t N,
+   const std::vector<sycl::event> &dependencies) {
    validate_params<T, K, WG_SIZE>();
    if (N == 0) {
       return T(0);
@@ -1332,6 +1374,13 @@ T sum(sycl::queue &q, const T *arr, size_t N) {
       throw std::length_error(
          "adn::sum input count exceeds max_reproducible_count<T>");
    }
+   if (N > std::numeric_limits<size_t>::max() / sizeof(T)) {
+      throw std::length_error("adn::sum byte size overflows size_t");
+   }
+   if (arr == nullptr) {
+      throw std::invalid_argument(
+         "adn::sum requires a non-null pointer when N is nonzero");
+   }
    validate_environment<T>(q);
 
    // If the pointer was allocated by SYCL (device/shared/host USM),
@@ -1339,13 +1388,25 @@ T sum(sycl::queue &q, const T *arr, size_t N) {
    // device memory, copy, compute, and free.
    auto ptr_type = sycl::get_pointer_type(arr, q.get_context());
    if (ptr_type != sycl::usm::alloc::unknown) {
-      return detail::sum_impl<T, K, WG_SIZE>(q, arr, N);
+      return detail::sum_impl<T, K, WG_SIZE>(q, arr, N, dependencies);
    }
 
    auto device_owner = detail::allocate_device_usm<T>(N, q);
    T *d_arr = device_owner.get();
-   q.memcpy(d_arr, arr, N * sizeof(T)).wait_and_throw();
-   return detail::sum_impl<T, K, WG_SIZE>(q, d_arr, N);
+   q.memcpy(d_arr, arr, N * sizeof(T), dependencies).wait_and_throw();
+   return detail::sum_impl<T, K, WG_SIZE>(q, d_arr, N, dependencies);
+}
+
+/**
+ * @brief Compute a bit-reproducible sum without explicit dependencies.
+ *
+ * When @p arr points to USM, the caller must ensure that all prior operations
+ * writing the input range have completed before this call.  The function is
+ * synchronous and returns only after its own submitted work has completed.
+ */
+template <int K = 3, int WG_SIZE = 256, typename T>
+T sum(sycl::queue &q, const T *arr, size_t N) {
+   return sum<K, WG_SIZE, T>(q, arr, N, {});
 }
 
 /**
@@ -1367,11 +1428,13 @@ T sum(sycl::queue &q, const T *arr, size_t N) {
  *                 @p input for an in-place cumulative sum.  Other overlapping
  *                 input and output ranges are not supported.
  * @param  N       Number of input and output elements.
+ * @param  dependencies Events that must complete before the library accesses
+ *                 either input or output.
  * @throws std::invalid_argument if a nonempty input or output is null.
  * @throws std::length_error if @p N exceeds the reproducible capacity or its
  *                           byte size cannot be represented by `size_t`.
  * @throws std::runtime_error if the device lacks the required IEEE 754
- *                             floating-point semantics.
+ *                             floating-point semantics or USM support.
  *
  * @note This operation is synchronous.  Plain host input is copied to a
  *       temporary device allocation and plain host output is copied back
@@ -1379,9 +1442,13 @@ T sum(sycl::queue &q, const T *arr, size_t N) {
  *
  * @note Both float and double cumulative sums require fp64 support because
  *       float conversion accumulates in double precision.
+ *
+ * @note Every nonempty cumulative sum requires shared and device USM support
+ *       for internal allocations.
  */
 template <int K = 3, int WG_SIZE = 256, typename T>
-void cumsum(sycl::queue &q, const T *input, T *output, size_t N) {
+void cumsum(sycl::queue &q, const T *input, T *output, size_t N,
+   const std::vector<sycl::event> &dependencies) {
    validate_params<T, K, WG_SIZE>();
    if (N == 0) {
       return;
@@ -1398,6 +1465,7 @@ void cumsum(sycl::queue &q, const T *input, T *output, size_t N) {
          "adn::cumsum requires non-null pointers when N is nonzero");
    }
    validate_environment<T>(q);
+   detail::validate_device_usm_capability(q.get_device());
 
    const auto input_type = sycl::get_pointer_type(input, q.get_context());
    const auto output_type = sycl::get_pointer_type(output, q.get_context());
@@ -1406,15 +1474,16 @@ void cumsum(sycl::queue &q, const T *input, T *output, size_t N) {
    const size_t bytes = N * sizeof(T);
 
    if (input_is_usm && output_is_usm) {
-      detail::cumsum_impl<T, K, WG_SIZE>(q, input, output, N);
+      detail::cumsum_impl<T, K, WG_SIZE>(q, input, output, N, dependencies);
       return;
    }
 
    if (input == output) {
       auto device_owner = detail::allocate_device_usm<T>(N, q);
       T *device_data = device_owner.get();
-      q.memcpy(device_data, input, bytes).wait_and_throw();
-      detail::cumsum_impl<T, K, WG_SIZE>(q, device_data, device_data, N);
+      q.memcpy(device_data, input, bytes, dependencies).wait_and_throw();
+      detail::cumsum_impl<T, K, WG_SIZE>(
+         q, device_data, device_data, N, dependencies);
       q.memcpy(output, device_data, bytes).wait_and_throw();
       return;
    }
@@ -1428,7 +1497,7 @@ void cumsum(sycl::queue &q, const T *input, T *output, size_t N) {
    if (!input_is_usm) {
       input_owner = detail::allocate_device_usm<T>(N, q);
       device_input = input_owner.get();
-      q.memcpy(input_owner.get(), input, bytes).wait_and_throw();
+      q.memcpy(input_owner.get(), input, bytes, dependencies).wait_and_throw();
    }
 
    T *device_output = output;
@@ -1437,11 +1506,25 @@ void cumsum(sycl::queue &q, const T *input, T *output, size_t N) {
       device_output = output_owner.get();
    }
 
-   detail::cumsum_impl<T, K, WG_SIZE>(q, device_input, device_output, N);
+   detail::cumsum_impl<T, K, WG_SIZE>(
+      q, device_input, device_output, N, dependencies);
 
    if (!output_is_usm) {
       q.memcpy(output, output_owner.get(), bytes).wait_and_throw();
    }
+}
+
+/**
+ * @brief Compute reproducible cumulative sums without explicit dependencies.
+ *
+ * When @p input or @p output points to USM, the caller must ensure that all
+ * conflicting prior operations have completed before this call and that no
+ * concurrent operation accesses those ranges during the call.  The function
+ * is synchronous and returns only after its own submitted work has completed.
+ */
+template <int K = 3, int WG_SIZE = 256, typename T>
+void cumsum(sycl::queue &q, const T *input, T *output, size_t N) {
+   cumsum<K, WG_SIZE, T>(q, input, output, N, {});
 }
 
 } // namespace adn
