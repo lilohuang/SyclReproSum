@@ -77,7 +77,7 @@
 /// @{
 #define SYCL_REPRO_SUM_VERSION_MAJOR 1
 #define SYCL_REPRO_SUM_VERSION_MINOR 2
-#define SYCL_REPRO_SUM_VERSION_PATCH 0
+#define SYCL_REPRO_SUM_VERSION_PATCH 1
 #define SYCL_REPRO_SUM_VERSION                                                 \
    (SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +                                     \
       SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH)

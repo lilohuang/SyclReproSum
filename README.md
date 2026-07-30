@@ -10,13 +10,13 @@ implementation.
   is exactly the same bits on every run, for any input order, supported
   work-group size, or thread scheduling on a validated device. Each cumulative
   sum has the same guarantee for the values in that prefix.
-- **Cross-device** - validated CPU, NVIDIA GPU, and Intel GPU devices produce
-  *identical* results from the same input; this is tested here across CUDA,
-  Level-Zero, and OpenCL backends.
+- **Cross-device** - validated CPU, NVIDIA GPU, AMD GPU, and Intel GPU devices
+  produce *identical* results from the same input; this is tested here across
+  CUDA, HIP, Level-Zero, and OpenCL backends.
 - **Efficient algorithms** - `adn::sum` reads the device input once and
   approaches the plain `sycl::reduction` throughput baseline on the tested
-  NVIDIA GPU. `adn::cumsum` uses a hierarchical binned scan without a
-  full accumulator per output element.
+  NVIDIA and AMD GPUs. `adn::cumsum` uses a hierarchical binned scan without
+  a full accumulator per output element.
 - **Robust** - Inf/NaN propagate deterministically using a fixed canonical
   quiet NaN, subnormals are handled, and the dominant binned absolute-error
   term at the default K=3 is proportional to N * 2^-80 * max|x| for double.
@@ -27,8 +27,8 @@ implementation.
 
 Parallel floating-point reduction is **non-deterministic** - different
 thread scheduling orders produce different rounding errors, and different
-hardware (CPU vs GPU, NVIDIA vs Intel) produces different answers for the
-same data. Within its documented accumulator capacity, the
+hardware (CPU vs GPU, NVIDIA vs AMD vs Intel) produces different answers for
+the same data. Within its documented accumulator capacity, the
 Ahrens-Demmel-Nguyen binned format solves this by depositing every value into
 K accumulators aligned to a fixed grid of exponent bins, making the result
 **independent of execution order and of the device it ran on** - whether that
@@ -125,6 +125,7 @@ lets `double` and `float` be compared without the element-size bias of GB/s.
 |---|---:|---:|
 | NVIDIA GB10 (CUDA) | 26.3 / 31.7 (1.2x slower) | 55.5 / 62.9 (1.1x slower) |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | 48.7 / 77.0 (1.6x slower) | 121.2 / 124.5 (1.0x slower) |
+| AMD Radeon Pro W7500 (HIP) | 9.2 / 14.8 (1.6x slower) | 15.7 / 20.0 (1.3x slower) |
 | Intel Graphics [0x7d67] (Level-Zero) | 1.7 / 6.6 (3.8x slower) | 4.1 / 12.5 (3.0x slower) |
 | Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.8 (13.6x slower) | 0.6 / 7.4 (12.3x slower) |
 
@@ -151,6 +152,7 @@ provide the reproducibility guarantees of `adn::cumsum`.
 |---|---:|---:|
 | NVIDIA GB10 (CUDA) | 2.364 / 7.606 (3.2x slower) | 3.413 / 14.980 (4.4x slower) |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | 4.855 / 21.383 (4.4x slower) | 6.696 / 40.480 (6.0x slower) |
+| AMD Radeon Pro W7500 (HIP) | 0.751 / 4.876 (6.5x slower) | 1.089 / 9.126 (8.4x slower) |
 | Intel Graphics [0x7d67] (Level-Zero) | 0.167 / 0.610 (3.7x slower) | 0.331 / 2.445 (7.4x slower) |
 | Intel Core Ultra 7 265 CPU (OpenCL) | 0.118 / 1.490 (12.6x slower) | 0.138 / 2.536 (18.4x slower) |
 
@@ -167,6 +169,7 @@ single fat binary providing device code for all targets on each system:
 |---|---|---|
 | NVIDIA GB10 (CUDA) | `0x430FC878C605717F` | same bits |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | `0x430FC878C605717F` | same bits |
+| AMD Radeon Pro W7500 (HIP) | `0x430FC878C605717F` | same bits |
 | Intel Graphics [0x7d67] (Level-Zero) | `0x430FC878C605717F` | same bits |
 | Intel Core Ultra 7 265 CPU (OpenCL) | `0x430FC878C605717F` | same bits |
 
@@ -393,8 +396,8 @@ effective device behavior and reject unsafe combinations.
   (required by float and double sums and cumulative sums)
 - Shared USM support, plus device USM support for cumulative sums and sums of
   plain host arrays
-- For GPU: NVIDIA GPU + CUDA toolkit (for `nvptx64` target), and/or Intel
-  GPU runtime (for `spir64`)
+- For GPU: NVIDIA GPU + CUDA toolkit (for `nvptx64`), AMD GPU + ROCm (for
+  `amdgcn`), and/or Intel GPU runtime (for `spir64`)
 - For CPU: Intel OpenCL CPU runtime (`intel-oneapi-runtime-opencl`)
 - CMake + g++ (for building Google Test)
 
@@ -416,7 +419,51 @@ make test
 
 # Build everything
 make all
+
+# Rebuild and test hostile host/device floating-point modes
+make test-validation
 ```
+
+CUDA, SPIR-V, and AMD HIP support are all enabled by default. The normal
+`make`, `make all`, `make run`, `make test`, and `make test-validation`
+targets build the same CUDA + SPIR-V + AMDGCN fat binaries. The test suite
+therefore includes every enabled, visible Intel, NVIDIA, and AMD device.
+
+Disable a backend when its toolkit or runtime is unavailable:
+
+```bash
+make test ENABLE_AMD=0
+make test ENABLE_NVIDIA=0
+make test ENABLE_SPIRV=0
+
+# Intel/SPIR-V only
+make test ENABLE_AMD=0 ENABLE_NVIDIA=0
+
+# AMD/HIP only
+make test ENABLE_NVIDIA=0 ENABLE_SPIRV=0
+```
+
+When AMD support is enabled, `AMD_GPU_ARCH` is auto-detected with
+`rocm_agent_enumerator`. Set it explicitly when auto-detection is unavailable
+or when selecting one architecture from a multi-GPU system:
+
+```bash
+make test AMD_GPU_ARCH=gfx1102
+make test-validation AMD_GPU_ARCH=gfx1102
+```
+
+The test binary includes the oneDPL cumulative-sum benchmark. Until
+[intel/llvm#22665](https://github.com/intel/llvm/pull/22665) is available in
+the compiler, its AMD libspirv device library must be patched with the missing
+group non-uniform shuffle builtins. The Makefile also supplies the libspirv
+compatibility alias and the verified GlobalOffset LTO pipeline workaround
+automatically.
+
+The compatibility alias maps the driver lookup directory
+`amdgcn-amd-amdhsa` to the installed `amdgcn-amd-amdhsa-llvm` directory inside
+the selected compiler's resource directory. It does not modify LLVM source.
+This is the local workaround for
+[intel/llvm#19339](https://github.com/intel/llvm/issues/19339).
 
 ### Makefile Targets
 
@@ -439,11 +486,21 @@ Override via environment or command line:
 # /llvm/build/bin/clang++ and /llvm/build/lib.
 make DPCPP_HOME=/path/to/sycl_workspace
 
-# Target only NVIDIA GPU
-make SYCL_TARGETS=nvptx64-nvidia-cuda
+# Disable backends whose toolkits or runtimes are unavailable
+make ENABLE_AMD=0
+make ENABLE_NVIDIA=0
+make ENABLE_SPIRV=0
 
 # Custom oneDPL include directory for the benchmark baseline
 make ONEDPL_INC=/path/to/oneDPL/include
+
+# Override AMD architecture or libspirv
+make AMD_GPU_ARCH=gfx1102
+make AMD_LIBSPIRV=/path/to/libspirv.l64.signed_char.bc
+
+# Advanced target-list or runtime-device override
+make SYCL_TARGETS=nvptx64-nvidia-cuda
+make test ONEAPI_DEVICE_SELECTOR=hip:0
 ```
 
 ## Test Suite
@@ -451,11 +508,12 @@ make ONEDPL_INC=/path/to/oneDPL/include
 The Google Test suite chooses one preferred backend per distinct device name
 (Level-Zero, then CUDA, then other backends, with OpenCL as the fallback).
 Each correctness case runs once per selected CPU or GPU from a single fat
-binary (CUDA + SPIR-V), plus cross-device bit-identity tests and throughput
-benchmarks. There are 173 correctness cases and 4 benchmarks per device, plus
-10 cross-device cases and one version test: 542 tests on a system with two
-GPUs and one CPU. The `WG_SIZE=1024` cases skip on a device whose work-group or
-local memory limits cannot support that configuration.
+binary (CUDA + SPIR-V + AMDGCN by default), plus cross-device bit-identity
+tests and throughput benchmarks. There are 173 correctness cases and 4
+benchmarks per device, plus 10 cross-device cases and one version test: 719
+tests on a system with three GPUs and one CPU. The `WG_SIZE=1024` cases skip on
+a device whose work-group or local memory limits cannot support that
+configuration.
 
 | Category | Description |
 |----------|-------------|
