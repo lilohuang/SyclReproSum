@@ -310,6 +310,44 @@ TEST_P(ADNSumTest, USMCapabilitiesValidated) {
    }
 }
 
+TEST_P(ADNSumTest, WorkGroupCapacityValidated) {
+   const sycl::device &device = queue().get_device();
+   if (!device.has(sycl::aspect::fp64)) {
+      GTEST_SKIP() << "Device does not support fp64";
+   }
+
+   constexpr int fold = 9;
+   constexpr int wg_size = 512;
+   constexpr size_t needed =
+      size_t(wg_size) * sizeof(adn::detail::Binned<double, fold>);
+   const bool fits =
+      device.get_info<sycl::info::device::max_work_group_size>() >= wg_size &&
+      device.get_info<sycl::info::device::local_mem_size>() >= needed;
+
+   std::vector<double> input(10000, 1.0);
+   std::vector<double> output(input.size());
+   if (fits) {
+      EXPECT_NO_THROW(
+         (adn::detail::validate_work_group_capacity<double, fold, wg_size>(
+            device)));
+      EXPECT_EQ((adn::sum<fold, wg_size>(queue(), input.data(), input.size())),
+         10000.0);
+      return;
+   }
+
+   EXPECT_THROW(
+      (adn::detail::validate_work_group_capacity<double, fold, wg_size>(
+         device)),
+      std::runtime_error);
+   // The library must report the shortfall itself rather than let the
+   // backend surface an opaque out-of-resources error.
+   EXPECT_THROW((adn::sum<fold, wg_size>(queue(), input.data(), input.size())),
+      std::runtime_error);
+   EXPECT_THROW((adn::cumsum<fold, wg_size>(
+                   queue(), input.data(), output.data(), input.size())),
+      std::runtime_error);
+}
+
 TEST_P(ADNSumTest, DeviceEnvironmentValidated) {
    const sycl::device &device = queue().get_device();
    const std::string name = device.get_info<sycl::info::device::name>();

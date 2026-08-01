@@ -77,7 +77,7 @@
 /// @{
 #define SYCL_REPRO_SUM_VERSION_MAJOR 1
 #define SYCL_REPRO_SUM_VERSION_MINOR 2
-#define SYCL_REPRO_SUM_VERSION_PATCH 1
+#define SYCL_REPRO_SUM_VERSION_PATCH 2
 #define SYCL_REPRO_SUM_VERSION                                                 \
    (SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +                                     \
       SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH)
@@ -103,6 +103,7 @@
 #include <mutex>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -1141,6 +1142,39 @@ inline void validate_device_capabilities(const sycl::device &device) {
 }
 
 /**
+ * @brief Reject a work-group size the device cannot support.
+ *
+ * The reduction and scan kernels keep one Binned<T, K> per work-item in
+ * local memory, so large K or WG_SIZE combinations can exceed the device
+ * budget.  Backends report the shortfall only as an opaque out-of-resources
+ * error at kernel submission, so check it up front instead.
+ *
+ * The reported local memory size is an upper bound: a backend may reserve
+ * part of it, so a request that passes this check can still be rejected.
+ */
+template <typename T, int K, int WG_SIZE>
+inline void validate_work_group_capacity(const sycl::device &device) {
+   const size_t max_work_group_size =
+      device.get_info<sycl::info::device::max_work_group_size>();
+   if (size_t(WG_SIZE) > max_work_group_size) {
+      throw std::runtime_error("adn: WG_SIZE " + std::to_string(WG_SIZE) +
+         " exceeds the device maximum work-group size " +
+         std::to_string(max_work_group_size));
+   }
+
+   const size_t required = size_t(WG_SIZE) * sizeof(Binned<T, K>);
+   const size_t available =
+      device.get_info<sycl::info::device::local_mem_size>();
+   if (required > available) {
+      throw std::runtime_error("adn: the binned accumulators need " +
+         std::to_string(required) +
+         " bytes of local memory per work-group "
+         "but the device provides " +
+         std::to_string(available) + "; reduce WG_SIZE or K");
+   }
+}
+
+/**
  * @brief Run arithmetic on the device to verify its effective FP semantics.
  */
 template <typename T> inline void run_device_environment_probe(sycl::queue &q) {
@@ -1164,6 +1198,9 @@ template <typename T> inline void run_device_environment_probe(sycl::queue &q) {
 
    q.submit([=](sycl::handler &h) {
       h.single_task<EnvironmentProbeKernel<T>>([=]() {
+         // Repeated inside the kernel body because the enclosing function's
+         // pragma is not guaranteed to propagate into the lambda.
+         SYCL_REPRO_SUM_DETAIL_STRICT_FP
          probe->compiled_half_min_normal =
             std::numeric_limits<T>::min() * T(0.5);
          probe->half_min_normal = probe->min_normal * probe->half;
@@ -1346,7 +1383,9 @@ template <typename T, int K, int WG_SIZE> constexpr void validate_params() {
  * @throws std::length_error if @p N exceeds @ref max_reproducible_count or
  *                           its byte size cannot be represented by `size_t`.
  * @throws std::runtime_error if the device lacks the required IEEE 754
- *                             floating-point semantics or USM support.
+ *                             floating-point semantics or USM support, or
+ *                             cannot support @p WG_SIZE work-items and their
+ *                             binned accumulators in local memory.
  *
  * @note Both float and double sums require device fp64 support because the
  *       final float conversion accumulates in double precision.
@@ -1382,6 +1421,7 @@ T sum(sycl::queue &q, const T *arr, size_t N,
          "adn::sum requires a non-null pointer when N is nonzero");
    }
    validate_environment<T>(q);
+   detail::validate_work_group_capacity<T, K, WG_SIZE>(q.get_device());
 
    // If the pointer was allocated by SYCL (device/shared/host USM),
    // use it directly.  Otherwise it is a plain host pointer: allocate
@@ -1434,7 +1474,9 @@ T sum(sycl::queue &q, const T *arr, size_t N) {
  * @throws std::length_error if @p N exceeds the reproducible capacity or its
  *                           byte size cannot be represented by `size_t`.
  * @throws std::runtime_error if the device lacks the required IEEE 754
- *                             floating-point semantics or USM support.
+ *                             floating-point semantics or USM support, or
+ *                             cannot support @p WG_SIZE work-items and their
+ *                             binned accumulators in local memory.
  *
  * @note This operation is synchronous.  Plain host input is copied to a
  *       temporary device allocation and plain host output is copied back
@@ -1465,6 +1507,7 @@ void cumsum(sycl::queue &q, const T *input, T *output, size_t N,
          "adn::cumsum requires non-null pointers when N is nonzero");
    }
    validate_environment<T>(q);
+   detail::validate_work_group_capacity<T, K, WG_SIZE>(q.get_device());
    detail::validate_device_usm_capability(q.get_device());
 
    const auto input_type = sycl::get_pointer_type(input, q.get_context());
