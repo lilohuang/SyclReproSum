@@ -28,6 +28,9 @@ Enforced by `.clang-format` + CI (`.github/workflows/format.yml`):
   license notices unchanged.
 - Run `clang-format-18 -i repro_sum.hpp repro_test.cpp example.cpp`
   before committing.
+- If `clang-format-18` is unavailable, install clang-format 18 under `/tmp`
+  and run it from there. Do not skip formatting because the system package is
+  missing.
 
 ## Layout
 

@@ -443,11 +443,16 @@ make test ENABLE_AMD=0 ENABLE_NVIDIA=0
 make test ENABLE_NVIDIA=0 ENABLE_SPIRV=0
 ```
 
-When AMD support is enabled, `AMD_GPU_ARCH` is auto-detected with
-`rocm_agent_enumerator`. Set it explicitly when auto-detection is unavailable
-or when selecting one architecture from a multi-GPU system:
+When NVIDIA or AMD support is enabled, the GPU architecture is auto-detected
+with `nvidia-smi` or `rocm_agent_enumerator`, respectively. Set `CUDA_ARCH` or
+`AMD_GPU_ARCH` explicitly when auto-detection is unavailable or when
+cross-compiling. On a multi-GPU system, auto-detection uses the first
+architecture reported by the corresponding tool; use an explicit override to
+target a different installed architecture:
 
 ```bash
+make test CUDA_ARCH=sm_86
+make test-validation CUDA_ARCH=sm_86
 make test AMD_GPU_ARCH=gfx1102
 make test-validation AMD_GPU_ARCH=gfx1102
 ```
@@ -494,7 +499,8 @@ make ENABLE_SPIRV=0
 # Custom oneDPL include directory for the benchmark baseline
 make ONEDPL_INC=/path/to/oneDPL/include
 
-# Override AMD architecture or libspirv
+# Override NVIDIA or AMD architecture, or AMD libspirv
+make CUDA_ARCH=sm_86
 make AMD_GPU_ARCH=gfx1102
 make AMD_LIBSPIRV=/path/to/libspirv.l64.signed_char.bc
 

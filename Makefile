@@ -18,6 +18,7 @@
 #    DPCPP_HOME      - path to DPC++ installation (default: ~/sycl_workspace)
 #    SYCL_TARGETS    - explicit offload target override
 #    ONEDPL_INC      - oneDPL include directory (auto-detected when possible)
+#    CUDA_ARCH       - NVIDIA GPU architecture (auto-detected when possible)
 #    AMD_GPU_ARCH    - AMDGPU architecture (auto-detected when possible)
 #    AMD_LIBSPIRV    - AMD libspirv bitcode file (auto-detected)
 # ============================================================
@@ -74,6 +75,10 @@ SPIRV_TARGET_ENABLED = $(filter $(SPIRV_TARGET),$(SYCL_TARGET_LIST))
 AMD_TARGET_ENABLED   = $(filter $(AMD_TARGET),$(SYCL_TARGET_LIST))
 
 CXX                  = $(DPCPP_HOME)/llvm/build/bin/clang++
+CUDA_COMPUTE_CAP     = $(firstword $(shell nvidia-smi \
+	--query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d '.'))
+CUDA_DETECTED_ARCH   = $(if $(CUDA_COMPUTE_CAP),sm_$(CUDA_COMPUTE_CAP))
+CUDA_ARCH            ?= $(CUDA_DETECTED_ARCH)
 AMD_AGENT_ENUMERATOR ?= rocm_agent_enumerator
 AMD_DETECTED_ARCH    = $(firstword $(filter-out gfx000, \
 	$(filter gfx%, $(shell $(AMD_AGENT_ENUMERATOR) 2>/dev/null))))
@@ -87,6 +92,12 @@ AMD_LIBSPIRV_SOURCE_DIR = $(patsubst %/,%,$(abspath \
 AMD_LIBSPIRV_ALIAS_DIR = $(AMD_RESOURCE_DIR)/lib/$(AMD_TARGET)
 AMD_LIBSPIRV_ALIAS   = $(AMD_LIBSPIRV_ALIAS_DIR)/$(AMD_LIBSPIRV_NAME)
 
+ifneq ($(NVIDIA_TARGET_ENABLED),)
+NVIDIA_TARGET_FLAGS = \
+	-Xsycl-target-backend=$(NVIDIA_TARGET) \
+	--cuda-gpu-arch=$(CUDA_ARCH)
+endif
+
 ifneq ($(AMD_TARGET_ENABLED),)
 AMD_TARGET_FLAGS = \
 	-Xsycl-target-backend=$(AMD_TARGET) \
@@ -96,7 +107,7 @@ AMD_LINK_FLAGS = -Xoffload-linker=$(AMD_TARGET) \
 endif
 
 CXXFLAGS = -std=c++17 -O3 -fsycl -fsycl-targets=$(SYCL_TARGETS) \
-	$(AMD_TARGET_FLAGS)
+	$(NVIDIA_TARGET_FLAGS) $(AMD_TARGET_FLAGS)
 LDFLAGS = $(AMD_LINK_FLAGS)
 
 ENABLED_DEVICE_SELECTORS :=
@@ -167,6 +178,14 @@ test: repro_test
 check-config:
 	@echo "SYCL targets: $(SYCL_TARGETS)"
 	@echo "Device selector: $(ONEAPI_DEVICE_SELECTOR)"
+ifneq ($(NVIDIA_TARGET_ENABLED),)
+	@if [ -z "$(CUDA_ARCH)" ]; then \
+		echo "Unable to detect an NVIDIA GPU architecture."; \
+		echo "Set CUDA_ARCH explicitly, for example sm_86."; \
+		exit 2; \
+	fi
+	@echo "NVIDIA target: $(NVIDIA_TARGET) ($(CUDA_ARCH))"
+endif
 ifneq ($(AMD_TARGET_ENABLED),)
 	@if [ -z "$(AMD_GPU_ARCH)" ]; then \
 		echo "Unable to detect an AMD GPU architecture."; \
