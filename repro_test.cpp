@@ -690,6 +690,36 @@ TEST_P(ADNSumTest, K2_Correct) {
    EXPECT_NEAR(shuffle_and_sum<2>(v), 10000.0, 1e-6);
 }
 
+TEST_P(ADNSumTest, K2_MergeCompilerRegression) {
+   std::vector<double> pair{1.0, 1.0};
+   EXPECT_BIT_EQ(adn::sum<2>(queue(), pair.data(), pair.size()), 2.0);
+
+   std::vector<double> input;
+   for (int i = 0; i < 5; ++i) {
+      input.push_back(1e16);
+      input.push_back(-1e16);
+   }
+   input.insert(input.end(), 257, 1.0);
+
+   const double reference =
+      adn::sum<2, 64>(queue(), input.data(), input.size());
+   EXPECT_BIT_EQ(reference, 257.0);
+   for (unsigned seed = 0; seed < 3; ++seed) {
+      std::vector<double> shuffled = input;
+      std::mt19937 rng(seed);
+      std::shuffle(shuffled.begin(), shuffled.end(), rng);
+      EXPECT_BIT_EQ(
+         (adn::sum<2, 64>(queue(), shuffled.data(), shuffled.size())),
+         reference);
+      EXPECT_BIT_EQ(
+         (adn::sum<2, 128>(queue(), shuffled.data(), shuffled.size())),
+         reference);
+      EXPECT_BIT_EQ(
+         (adn::sum<2, 256>(queue(), shuffled.data(), shuffled.size())),
+         reference);
+   }
+}
+
 TEST_P(ADNSumTest, K4_Correct) {
    std::vector<double> v;
    for (int i = 0; i < 5; ++i) {
@@ -994,6 +1024,35 @@ TEST_P(ADNSumTest, Float_K2_Correct) {
       v.push_back(1.0f);
    }
    EXPECT_NEAR(shuffle_and_sum_f<2>(v), 10000.0f, 1.0f);
+}
+
+TEST_P(ADNSumTest, Float_K2_MergeCompilerRegression) {
+   std::vector<float> pair{1.0f, 1.0f};
+   EXPECT_BIT_EQ(adn::sum<2>(queue(), pair.data(), pair.size()), 2.0f);
+
+   std::vector<float> input;
+   for (int i = 0; i < 5; ++i) {
+      input.push_back(1e7f);
+      input.push_back(-1e7f);
+   }
+   input.insert(input.end(), 257, 1.0f);
+
+   const float reference = adn::sum<2, 64>(queue(), input.data(), input.size());
+   EXPECT_BIT_EQ(reference, 257.0f);
+   for (unsigned seed = 0; seed < 3; ++seed) {
+      std::vector<float> shuffled = input;
+      std::mt19937 rng(seed);
+      std::shuffle(shuffled.begin(), shuffled.end(), rng);
+      EXPECT_BIT_EQ(
+         (adn::sum<2, 64>(queue(), shuffled.data(), shuffled.size())),
+         reference);
+      EXPECT_BIT_EQ(
+         (adn::sum<2, 128>(queue(), shuffled.data(), shuffled.size())),
+         reference);
+      EXPECT_BIT_EQ(
+         (adn::sum<2, 256>(queue(), shuffled.data(), shuffled.size())),
+         reference);
+   }
 }
 
 TEST_P(ADNSumTest, Float_K3_Correct) {

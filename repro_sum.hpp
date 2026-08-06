@@ -77,7 +77,7 @@
 /// @{
 #define SYCL_REPRO_SUM_VERSION_MAJOR 1
 #define SYCL_REPRO_SUM_VERSION_MINOR 2
-#define SYCL_REPRO_SUM_VERSION_PATCH 3
+#define SYCL_REPRO_SUM_VERSION_PATCH 4
 #define SYCL_REPRO_SUM_VERSION                                                 \
    (SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +                                     \
       SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH)
@@ -553,7 +553,32 @@ inline void merge(Binned<T, K> &y, const Binned<T, K> &x) {
    const int xi = accum_index(x);
    const int yi = accum_index(y);
    const int shift = yi - xi;
-   if (shift > 0) {
+   if constexpr (K == 2) {
+      // Keep the two-fold specialization loop-free.  Intel IGC's
+      // PropagateCmpUniformity pass can replace the index of a two-iteration
+      // self-loop with zero, merging bin 0 twice and skipping bin 1.
+      if (shift > 0) {
+         if (shift == 1) {
+            y.pri[1] = x.pri[1] + (y.pri[0] - bin_value<T>(yi));
+            y.car[1] = x.car[1] + y.car[0];
+            y.pri[0] = x.pri[0];
+            y.car[0] = x.car[0];
+         } else {
+            y.pri[0] = x.pri[0];
+            y.car[0] = x.car[0];
+            y.pri[1] = x.pri[1];
+            y.car[1] = x.car[1];
+         }
+      } else if (shift == 0) {
+         y.pri[0] += x.pri[0] - bin_value<T>(xi);
+         y.car[0] += x.car[0];
+         y.pri[1] += x.pri[1] - bin_value<T>(xi + 1);
+         y.car[1] += x.car[1];
+      } else if (shift == -1) {
+         y.pri[1] += x.pri[0] - bin_value<T>(xi);
+         y.car[1] += x.car[0];
+      }
+   } else if (shift > 0) {
       // x has the coarser (smaller) index: realign y to x's bins.
       for (int i = K - 1; i >= shift; --i) {
          y.pri[i] =
