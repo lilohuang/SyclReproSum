@@ -83,14 +83,23 @@ AMD_AGENT_ENUMERATOR ?= rocm_agent_enumerator
 AMD_DETECTED_ARCH    = $(firstword $(filter-out gfx000, \
 	$(filter gfx%, $(shell $(AMD_AGENT_ENUMERATOR) 2>/dev/null))))
 AMD_GPU_ARCH         ?= $(AMD_DETECTED_ARCH)
-AMD_RESOURCE_DIR     = $(shell $(CXX) -print-resource-dir 2>/dev/null)
-AMD_LIBSPIRV_DIR     = $(AMD_RESOURCE_DIR)/lib/$(AMD_TARGET)-llvm
+REAL_RESOURCE_DIR    = $(shell $(CXX) -print-resource-dir 2>/dev/null)
 AMD_LIBSPIRV_NAME    = libspirv.l64.signed_char.bc
+AMD_LIBSPIRV_DIR     = $(REAL_RESOURCE_DIR)/lib/$(AMD_TARGET)-llvm
 AMD_LIBSPIRV         ?= $(AMD_LIBSPIRV_DIR)/$(AMD_LIBSPIRV_NAME)
 AMD_LIBSPIRV_SOURCE_DIR = $(patsubst %/,%,$(abspath \
 	$(dir $(AMD_LIBSPIRV))))
-AMD_LIBSPIRV_ALIAS_DIR = $(AMD_RESOURCE_DIR)/lib/$(AMD_TARGET)
-AMD_LIBSPIRV_ALIAS   = $(AMD_LIBSPIRV_ALIAS_DIR)/$(AMD_LIBSPIRV_NAME)
+CXX_ID               = $(shell $(CXX) --version 2>/dev/null | sha256sum | \
+	cut -c1-16)
+AMD_RESOURCE_CONFIG_KEY = $(shell printf '%s' \
+	'$(CXX)|$(CXX_ID)|$(SYCL_TARGETS)|$(AMD_GPU_ARCH)|$(AMD_LIBSPIRV)' | \
+	sha256sum | cut -c1-16)
+AMD_RESOURCE_OVERLAY_BASE = $(CURDIR)/build/clang-resource
+AMD_RESOURCE_OVERLAY = $(AMD_RESOURCE_OVERLAY_BASE)-$(AMD_RESOURCE_CONFIG_KEY)
+AMD_RESOURCE_READY   = $(AMD_RESOURCE_OVERLAY)/.ready
+AMD_LIBSPIRV_INPUT   = $(wildcard $(AMD_LIBSPIRV))
+AMD_LIBSPIRV_OVERLAY_DIR = $(AMD_RESOURCE_OVERLAY)/lib/$(AMD_TARGET)
+AMD_LIBSPIRV_OVERLAY = $(AMD_LIBSPIRV_OVERLAY_DIR)/$(AMD_LIBSPIRV_NAME)
 
 ifneq ($(NVIDIA_TARGET_ENABLED),)
 NVIDIA_TARGET_FLAGS = \
@@ -100,6 +109,7 @@ endif
 
 ifneq ($(AMD_TARGET_ENABLED),)
 AMD_TARGET_FLAGS = \
+	-resource-dir=$(AMD_RESOURCE_OVERLAY) \
 	-Xsycl-target-backend=$(AMD_TARGET) \
 	--offload-arch=$(AMD_GPU_ARCH)
 AMD_LINK_FLAGS = -Xoffload-linker=$(AMD_TARGET) \
@@ -199,23 +209,46 @@ ifneq ($(AMD_TARGET_ENABLED),)
 	fi
 	@echo "AMD target: $(AMD_TARGET) ($(AMD_GPU_ARCH))"
 	@echo "AMD libspirv: $(AMD_LIBSPIRV)"
+	@echo "AMD resource overlay: $(AMD_RESOURCE_OVERLAY)"
 endif
 
 prepare-toolchain: check-config
 ifneq ($(AMD_TARGET_ENABLED),)
-	@if [ ! -f "$(AMD_LIBSPIRV_ALIAS)" ]; then \
-		if [ -e "$(AMD_LIBSPIRV_ALIAS_DIR)" ] || \
-			[ -L "$(AMD_LIBSPIRV_ALIAS_DIR)" ]; then \
-			echo "Invalid AMD libspirv path: $(AMD_LIBSPIRV_ALIAS_DIR)"; \
-			exit 2; \
-		fi; \
-		if ! ln -s "$(AMD_LIBSPIRV_SOURCE_DIR)" \
-				"$(AMD_LIBSPIRV_ALIAS_DIR)"; then \
-			echo "Unable to create the AMD libspirv alias."; \
-			exit 2; \
-		fi; \
-		echo "Created AMD libspirv alias: $(AMD_LIBSPIRV_ALIAS_DIR)"; \
+prepare-toolchain: $(AMD_RESOURCE_READY)
+endif
+
+$(AMD_RESOURCE_READY): Makefile $(BUILD_CONFIG) $(AMD_LIBSPIRV_INPUT) | \
+		$(CURDIR)/build
+ifneq ($(AMD_TARGET_ENABLED),)
+	@if [ ! -f "$(AMD_LIBSPIRV)" ]; then \
+		echo "AMD libspirv not found: $(AMD_LIBSPIRV)"; \
+		echo "Set AMD_LIBSPIRV to the signed-char bitcode file."; \
+		exit 2; \
 	fi
+	@mkdir -p "$(AMD_RESOURCE_OVERLAY)/lib"
+	@ln -sfn "$(REAL_RESOURCE_DIR)/include" \
+		"$(AMD_RESOURCE_OVERLAY)/include"
+	@for source in "$(REAL_RESOURCE_DIR)"/lib/*; do \
+		name="$${source##*/}"; \
+		if [ "$$name" != "$(AMD_TARGET)" ]; then \
+			ln -sfn "$$source" "$(AMD_RESOURCE_OVERLAY)/lib/$$name"; \
+		fi; \
+	done
+	@if [ -L "$(AMD_LIBSPIRV_OVERLAY_DIR)" ]; then \
+		rm -f "$(AMD_LIBSPIRV_OVERLAY_DIR)"; \
+	fi
+	@mkdir -p "$(AMD_LIBSPIRV_OVERLAY_DIR)"
+	@for source in "$(AMD_LIBSPIRV_SOURCE_DIR)"/*; do \
+		name="$${source##*/}"; \
+		if [ "$$name" != "$(AMD_LIBSPIRV_NAME)" ]; then \
+			ln -sfn "$$source" \
+				"$(AMD_LIBSPIRV_OVERLAY_DIR)/$$name"; \
+		fi; \
+	done
+	@$(CXX) -target $(AMD_TARGET) -nogpulib -Wno-override-module \
+		-c -emit-llvm "$(AMD_LIBSPIRV)" \
+		-o "$(AMD_LIBSPIRV_OVERLAY)"
+	@touch $@
 endif
 
 test-validation: test-hostile-host test-unsafe-device

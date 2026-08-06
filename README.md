@@ -461,13 +461,14 @@ The test binary includes the oneDPL cumulative-sum benchmark. Until
 [intel/llvm#22665](https://github.com/intel/llvm/pull/22665) is available in
 the compiler, its AMD libspirv device library must be patched with the missing
 group non-uniform shuffle builtins. The Makefile also supplies the libspirv
-compatibility alias and the verified GlobalOffset LTO pipeline workaround
+compatibility layout and the verified GlobalOffset LTO pipeline workaround
 automatically.
 
-The compatibility alias maps the driver lookup directory
-`amdgcn-amd-amdhsa` to the installed `amdgcn-amd-amdhsa-llvm` directory inside
-the selected compiler's resource directory. It does not modify LLVM source.
-This is the local workaround for
+The compatibility layout is created inside a configuration-specific
+`build/clang-resource-*` directory. The Makefile re-emits the signed-character
+libspirv bitcode with the `amdgcn-amd-amdhsa` target triple, avoiding a target
+triple mismatch during device linking. It does not modify the selected
+compiler installation. This is the local workaround for
 [intel/llvm#19339](https://github.com/intel/llvm/issues/19339).
 
 ### Makefile Targets
