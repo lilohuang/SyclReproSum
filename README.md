@@ -126,7 +126,8 @@ lets `double` and `float` be compared without the element-size bias of GB/s.
 | NVIDIA GB10 (CUDA) | 26.3 / 31.7 (1.2x slower) | 55.5 / 62.9 (1.1x slower) |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | 48.7 / 77.0 (1.6x slower) | 121.2 / 124.5 (1.0x slower) |
 | AMD Radeon Pro W7500 (HIP) | 9.2 / 14.8 (1.6x slower) | 15.7 / 20.0 (1.3x slower) |
-| Intel Graphics [0x7d67] (Level-Zero) | 1.7 / 6.6 (3.8x slower) | 4.1 / 12.5 (3.0x slower) |
+| Intel Arc Pro B70 (Level-Zero) | 21.1 / 52.6 (2.5x slower) | 47.4 / 85.5 (1.8x slower) |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 1.7 / 6.6 (3.8x slower) | 4.1 / 12.5 (3.0x slower) |
 | Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.8 (13.6x slower) | 0.6 / 7.4 (12.3x slower) |
 
 *Baseline = plain (non-reproducible) `sycl::reduction` of the same data
@@ -153,7 +154,8 @@ provide the reproducibility guarantees of `adn::cumsum`.
 | NVIDIA GB10 (CUDA) | 2.364 / 7.606 (3.2x slower) | 3.413 / 14.980 (4.4x slower) |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | 4.855 / 21.383 (4.4x slower) | 6.696 / 40.480 (6.0x slower) |
 | AMD Radeon Pro W7500 (HIP) | 0.751 / 4.876 (6.5x slower) | 1.089 / 9.126 (8.4x slower) |
-| Intel Graphics [0x7d67] (Level-Zero) | 0.167 / 0.610 (3.7x slower) | 0.331 / 2.445 (7.4x slower) |
+| Intel Arc Pro B70 (Level-Zero) | 2.945 / 18.047 (6.1x slower) | 5.806 / 40.862 (7.0x slower) |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 0.167 / 0.610 (3.7x slower) | 0.331 / 2.445 (7.4x slower) |
 | Intel Core Ultra 7 265 CPU (OpenCL) | 0.118 / 1.490 (12.6x slower) | 0.138 / 2.536 (18.4x slower) |
 
 *Baseline = oneDPL `inclusive_scan` of the same data type on the same device.
@@ -170,7 +172,8 @@ single fat binary providing device code for all targets on each system:
 | NVIDIA GB10 (CUDA) | `0x430FC878C605717F` | same bits |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | `0x430FC878C605717F` | same bits |
 | AMD Radeon Pro W7500 (HIP) | `0x430FC878C605717F` | same bits |
-| Intel Graphics [0x7d67] (Level-Zero) | `0x430FC878C605717F` | same bits |
+| Intel Arc Pro B70 (Level-Zero) | `0x430FC878C605717F` | same bits |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | `0x430FC878C605717F` | same bits |
 | Intel Core Ultra 7 265 CPU (OpenCL) | `0x430FC878C605717F` | same bits |
 
 The test suite chooses one backend per distinct device name, preferring
