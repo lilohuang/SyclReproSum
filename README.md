@@ -124,10 +124,10 @@ elements/s. This lets `double` and `float` be compared without the element-size
 bias of GB/s.
 
 The SPIR rows were measured with version `1.2.5`. Native NVIDIA and AMD rows
-retain the published `1.2.4` measurements because their complete device
-bundles are byte-identical in `1.2.5`. All rows use `-O3` and the toolchains
-below. The DPC++ builds are pre-release versions. Each binned result and its
-baseline use the same device and toolchain.
+retain the published `1.2.4` measurements because their timed sum and
+cumulative-sum machine code is unchanged in `1.2.5`. All rows use `-O3` and
+the toolchains below. The DPC++ builds are pre-release versions. Each binned
+result and its baseline use the same device and toolchain.
 
 | Measured devices | DPC++ / Clang | Compiler revision | oneDPL |
 |---|---|---|---|
