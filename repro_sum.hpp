@@ -1129,7 +1129,11 @@ template <typename T> struct EnvironmentProbeData {
    T negative_zero_plus_zero;
 };
 
-template <typename T> class EnvironmentProbeKernel;
+template <int K, int WG_SIZE> struct SumSpecialization {};
+template <int K, int WG_SIZE> struct CumsumSpecialization {};
+
+template <typename T, typename Specialization = void>
+class EnvironmentProbeKernel;
 
 inline bool has_fp_config(const std::vector<sycl::info::fp_config> &config,
    sycl::info::fp_config value) {
@@ -1210,7 +1214,8 @@ inline void validate_work_group_capacity(const sycl::device &device) {
 /**
  * @brief Run arithmetic on the device to verify its effective FP semantics.
  */
-template <typename T> inline void run_device_environment_probe(sycl::queue &q) {
+template <typename T, typename Specialization = void>
+inline void run_device_environment_probe(sycl::queue &q) {
    SYCL_REPRO_SUM_DETAIL_STRICT_FP
    using B = typename fp<T>::bits_t;
    constexpr B half_min_normal_bits = B(1) << (fp<T>::mant_dig - 2);
@@ -1230,7 +1235,7 @@ template <typename T> inline void run_device_environment_probe(sycl::queue &q) {
    probe->negative_zero = from_bits<T>(negative_zero_bits);
 
    q.submit([=](sycl::handler &h) {
-      h.single_task<EnvironmentProbeKernel<T>>([=]() {
+      h.single_task<EnvironmentProbeKernel<T, Specialization>>([=]() {
          // Repeated inside the kernel body because the enclosing function's
          // pragma is not guaranteed to propagate into the lambda.
          SYCL_REPRO_SUM_DETAIL_STRICT_FP
@@ -1272,7 +1277,8 @@ template <typename T> inline void run_device_environment_probe(sycl::queue &q) {
    }
 }
 
-template <typename T> struct DeviceValidationSlot {
+template <typename T, typename Specialization = void>
+struct DeviceValidationSlot {
    sycl::backend backend;
    sycl::device device;
    std::once_flag once;
@@ -1282,16 +1288,19 @@ template <typename T> struct DeviceValidationSlot {
       : backend(backend_value), device(device_value) {}
 };
 
-template <typename T>
-inline const std::vector<std::unique_ptr<DeviceValidationSlot<T>>> &
+template <typename T, typename Specialization = void>
+inline const std::vector<
+   std::unique_ptr<DeviceValidationSlot<T, Specialization>>> &
 device_validation_slots() {
    static const auto slots = [] {
-      std::vector<std::unique_ptr<DeviceValidationSlot<T>>> result;
+      std::vector<std::unique_ptr<DeviceValidationSlot<T, Specialization>>>
+         result;
       for (const sycl::platform &platform : sycl::platform::get_platforms()) {
          const sycl::backend backend = platform.get_backend();
          for (const sycl::device &device : platform.get_devices()) {
             result.push_back(
-               std::make_unique<DeviceValidationSlot<T>>(backend, device));
+               std::make_unique<DeviceValidationSlot<T, Specialization>>(
+                  backend, device));
          }
       }
       return result;
@@ -1299,10 +1308,10 @@ device_validation_slots() {
    return slots;
 }
 
-template <typename T>
-inline DeviceValidationSlot<T> *find_device_validation_slot(
+template <typename T, typename Specialization = void>
+inline DeviceValidationSlot<T, Specialization> *find_device_validation_slot(
    sycl::backend backend, const sycl::device &device) {
-   for (const auto &slot : device_validation_slots<T>()) {
+   for (const auto &slot : device_validation_slots<T, Specialization>()) {
       if (slot->backend == backend && slot->device == device) {
          return slot.get();
       }
@@ -1311,16 +1320,17 @@ inline DeviceValidationSlot<T> *find_device_validation_slot(
 }
 
 /**
- * @brief Validate and cache one backend/device/type combination.
+ * @brief Validate and cache one backend/device/type/operation combination.
  */
-template <typename T> inline void validate_device_environment(sycl::queue &q) {
+template <typename T, typename Specialization = void>
+inline void validate_device_environment(sycl::queue &q) {
    const sycl::backend backend = q.get_backend();
    const sycl::device device = q.get_device();
-   DeviceValidationSlot<T> *slot =
-      find_device_validation_slot<T>(backend, device);
+   DeviceValidationSlot<T, Specialization> *slot =
+      find_device_validation_slot<T, Specialization>(backend, device);
    auto validate = [&] {
       validate_device_capabilities<T>(device);
-      run_device_environment_probe<T>(q);
+      run_device_environment_probe<T, Specialization>(q);
    };
 
    if (slot == nullptr) {
@@ -1330,6 +1340,15 @@ template <typename T> inline void validate_device_environment(sycl::queue &q) {
       return;
    }
    std::call_once(slot->once, validate);
+}
+
+template <typename T, typename Specialization = void>
+inline void validate_environment_for(sycl::queue &q) {
+   validate_fp_type<T>();
+   validate_device_environment<double, Specialization>(q);
+   if constexpr (std::is_same_v<T, float>) {
+      validate_device_environment<float, Specialization>(q);
+   }
 }
 
 } // namespace detail
@@ -1352,9 +1371,11 @@ inline constexpr std::uint64_t max_reproducible_count = [] {
 /**
  * @brief Validate the device floating-point environment and shared USM.
  *
- * A successful check is shared by all host threads and cached per backend,
- * device, and floating-point type.  Float sums also validate double precision
- * because their final conversion accumulates in double on the device.
+ * A successful explicit check is shared by all host threads and cached per
+ * backend, device, and floating-point type.  Each sum and cumulative-sum
+ * specialization has a separate check.  Float sums also validate double
+ * precision because their final conversion accumulates in double on the
+ * device.
  *
  * @tparam T Floating-point type (`float` or `double`).
  * @param q  SYCL queue bound to the target device.
@@ -1362,11 +1383,7 @@ inline constexpr std::uint64_t max_reproducible_count = [] {
  *                            support are absent.
  */
 template <typename T> void validate_environment(sycl::queue &q) {
-   detail::validate_fp_type<T>();
-   detail::validate_device_environment<double>(q);
-   if constexpr (std::is_same_v<T, float>) {
-      detail::validate_device_environment<float>(q);
-   }
+   detail::validate_environment_for<T>(q);
 }
 
 /**
@@ -1453,7 +1470,8 @@ T sum(sycl::queue &q, const T *arr, size_t N,
       throw std::invalid_argument(
          "adn::sum requires a non-null pointer when N is nonzero");
    }
-   validate_environment<T>(q);
+   detail::validate_environment_for<T, detail::SumSpecialization<K, WG_SIZE>>(
+      q);
    detail::validate_work_group_capacity<T, K, WG_SIZE>(q.get_device());
 
    // If the pointer was allocated by SYCL (device/shared/host USM),
@@ -1539,7 +1557,8 @@ void cumsum(sycl::queue &q, const T *input, T *output, size_t N,
       throw std::invalid_argument(
          "adn::cumsum requires non-null pointers when N is nonzero");
    }
-   validate_environment<T>(q);
+   detail::validate_environment_for<T,
+      detail::CumsumSpecialization<K, WG_SIZE>>(q);
    detail::validate_work_group_capacity<T, K, WG_SIZE>(q.get_device());
    detail::validate_device_usm_capability(q.get_device());
 

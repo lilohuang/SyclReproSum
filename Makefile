@@ -153,6 +153,9 @@ HOSTILE_HOST_TEST   = $(TEST_VARIANT_DIR)/repro_test_hostile_host
 DEVICE_DENORM_TEST  = $(TEST_VARIANT_DIR)/repro_test_device_denorm
 DEVICE_NOSZERO_TEST = $(TEST_VARIANT_DIR)/repro_test_device_noszero
 DEVICE_EVAL_LOG     = $(TEST_VARIANT_DIR)/device_eval.log
+MIXED_TU_TEST       = $(TEST_VARIANT_DIR)/validation_mixed_tu
+MIXED_TU_STRICT_OBJ = $(TEST_VARIANT_DIR)/validation_mixed_tu_strict.o
+MIXED_TU_HOSTILE_OBJ = $(TEST_VARIANT_DIR)/validation_mixed_tu_hostile.o
 
 # Runtime library path for execution
 export LD_LIBRARY_PATH := $(DPCPP_HOME)/llvm/build/lib:$(LD_LIBRARY_PATH)
@@ -162,7 +165,8 @@ export ONEAPI_DEVICE_SELECTOR
 
 .PHONY: all example test test-validation test-hostile-host \
 	test-unsafe-device test-device-denorm test-device-noszero \
-	test-device-eval run clean gtest check-config prepare-toolchain FORCE
+	test-device-eval test-mixed-tu-validation run clean gtest check-config \
+	prepare-toolchain FORCE
 
 all: example repro_test
 
@@ -251,7 +255,8 @@ ifneq ($(AMD_TARGET_ENABLED),)
 	@touch $@
 endif
 
-test-validation: test-hostile-host test-unsafe-device
+test-validation: test-hostile-host test-unsafe-device \
+	test-mixed-tu-validation
 
 test-hostile-host: $(HOSTILE_HOST_TEST)
 	$< "--gtest_filter=-*Bench*" --gtest_brief=1
@@ -272,6 +277,9 @@ test-device-eval: | prepare-toolchain $(TEST_VARIANT_DIR)
 	fi
 	@grep -q "device floating-point expressions must evaluate" \
 		$(DEVICE_EVAL_LOG)
+
+test-mixed-tu-validation: $(MIXED_TU_TEST)
+	$<
 
 $(HOSTILE_HOST_TEST): repro_test.cpp repro_sum.hpp Makefile \
 		$(BUILD_CONFIG) | gtest prepare-toolchain $(TEST_VARIANT_DIR)
@@ -295,6 +303,19 @@ $(DEVICE_NOSZERO_TEST): repro_test.cpp repro_sum.hpp Makefile \
 		-isystem $(ONEDPL_INC) -I$(GTEST_INC) $< \
 		$(GTEST_LIB)/libgtest.a $(GTEST_LIB)/libgtest_main.a \
 		-lpthread -o $@
+
+$(MIXED_TU_STRICT_OBJ): validation_mixed_tu.cpp repro_sum.hpp Makefile \
+		$(BUILD_CONFIG) | prepare-toolchain $(TEST_VARIANT_DIR)
+	$(CXX) $(CXXFLAGS) -DADN_VALIDATION_STRICT_TU -c $< -o $@
+
+$(MIXED_TU_HOSTILE_OBJ): validation_mixed_tu.cpp repro_sum.hpp Makefile \
+		$(BUILD_CONFIG) | prepare-toolchain $(TEST_VARIANT_DIR)
+	$(CXX) $(CXXFLAGS) -fdenormal-fp-math=positive-zero -c $< -o $@
+
+$(MIXED_TU_TEST): $(MIXED_TU_STRICT_OBJ) $(MIXED_TU_HOSTILE_OBJ) Makefile \
+		$(BUILD_CONFIG) | prepare-toolchain $(TEST_VARIANT_DIR)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(MIXED_TU_STRICT_OBJ) \
+		$(MIXED_TU_HOSTILE_OBJ) -o $@
 
 $(TEST_VARIANT_DIR):
 	mkdir -p $@

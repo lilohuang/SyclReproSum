@@ -382,12 +382,14 @@ Validation is fail-closed and covers:
   signed-zero probes.
 
 A successful device arithmetic check for a root-enumerated device is shared by
-all host threads and cached by backend, device, and floating-point type.
-Dynamically created sub-devices are not in that fixed cache and are validated
-on every use. Applications can optionally preflight a queue explicitly with
-`adn::validate_environment<float>(q)` or
-`adn::validate_environment<double>(q)`. Validation throws `std::runtime_error`
-with the failed prerequisite when the guarantee cannot be established.
+all host threads and cached by operation specialization, backend, device, and
+floating-point type. Dynamically created sub-devices are not in that fixed
+cache and are validated on every use. Applications can optionally preflight a
+queue explicitly with `adn::validate_environment<float>(q)` or
+`adn::validate_environment<double>(q)`. Operations still validate their own
+specialization because translation units can use different device compiler
+options. Validation throws `std::runtime_error` with the failed prerequisite
+when the guarantee cannot be established.
 
 ### Compiler safety
 
