@@ -37,7 +37,7 @@ Enforced by `.clang-format` + CI (`.github/workflows/format.yml`):
 - `repro_sum.hpp` - the entire library (public APIs: `adn::sum`, `adn::cumsum`,
   and `adn::validate_environment`).
 - `repro_test.cpp` - Google Test suite, value-parameterized over one preferred
-  backend per distinct GPU or CPU name (173 correctness cases and 4 throughput
+  backend per distinct GPU or CPU name (179 correctness cases and 4 throughput
   benchmarks per device), plus 10 cross-device cases and a version test.
 - `example.cpp` - minimal runnable usage example.
 - `third_party/googletest` - git submodule; never edit.

@@ -77,7 +77,7 @@
 /// @{
 #define SYCL_REPRO_SUM_VERSION_MAJOR 1
 #define SYCL_REPRO_SUM_VERSION_MINOR 2
-#define SYCL_REPRO_SUM_VERSION_PATCH 4
+#define SYCL_REPRO_SUM_VERSION_PATCH 5
 #define SYCL_REPRO_SUM_VERSION                                                 \
    (SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +                                     \
       SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH)
@@ -608,6 +608,10 @@ inline void merge(Binned<T, K> &y, const Binned<T, K> &x) {
  * Terms are summed in decreasing exponent order.  The double flavour
  * rescales near-overflow indices; the float flavour accumulates in
  * double, which provides the necessary headroom directly.
+ *
+ * Some CPU OpenCL runtimes miscompile the double conversion after consuming
+ * generic SPIR. Make each update observable in that device image; native
+ * NVIDIA and AMD targets retain the ordinary running value and code path.
  */
 template <typename T, int K> inline T conv(const Binned<T, K> &a) {
    SYCL_REPRO_SUM_DETAIL_STRICT_FP
@@ -643,7 +647,11 @@ template <typename T, int K> inline T conv(const Binned<T, K> &a) {
    } else {
       constexpr int mant = fp<double>::mant_dig;
       constexpr int bw = fp<double>::bin_width;
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+      volatile double Y = 0.0;
+#else
       double Y = 0.0;
+#endif
       int i = 0;
       if (xi <= (3 * mant) / bw) {
          // Indices near overflow: accumulate scaled down by 2^-(2m-W),

@@ -113,11 +113,27 @@ adn::cumsum(q, s_ptr, s_ptr, N);
 
 ## Performance
 
-The throughput benchmarks process 100M elements. The values below are the mean
-of three benchmark invocations, each measured as the average of 10 runs after
-one warmup run. Throughput is measured in GElements/s: billions of input
-elements processed per second, where 1 GElements/s = 10^9 elements/s. This
-lets `double` and `float` be compared without the element-size bias of GB/s.
+The throughput benchmarks process 100M elements with the defaults `K=3` and
+`WG_SIZE=256`. Each algorithm gets one warmup call followed by 10 timed
+synchronous calls. Each invocation converts their mean duration to throughput;
+the tables average the throughputs from three separate invocations. Slowdown
+factors use the unrounded averages. Timing uses device-USM arrays and excludes
+the initial host-to-device input copy. Throughput is measured in GElements/s:
+billions of input elements processed per second, where 1 GElements/s = 10^9
+elements/s. This lets `double` and `float` be compared without the element-size
+bias of GB/s.
+
+The SPIR rows were measured with version `1.2.5`. Native NVIDIA and AMD rows
+retain the published `1.2.4` measurements because their complete device
+bundles are byte-identical in `1.2.5`. All rows use `-O3` and the toolchains
+below. The DPC++ builds are pre-release versions. Each binned result and its
+baseline use the same device and toolchain.
+
+| Measured devices | DPC++ / Clang | Compiler revision | oneDPL |
+|---|---|---|---|
+| NVIDIA GB10 | 7.1.0 / 23 | `ca38ac56d6e3` | 2022.12.0 |
+| Intel Arc Pro B70 | 7.1.0 / 23 | `95ec82a14309` | 2022.13.0 |
+| RTX PRO 4500, W7500, Core Ultra 7 265 CPU and iGPU | 7.2.0 / 24 | `f3aadb6ba275` | 2022.13.0 |
 
 ### Scalar-sum throughput
 
@@ -126,9 +142,9 @@ lets `double` and `float` be compared without the element-size bias of GB/s.
 | NVIDIA GB10 (CUDA) | 26.3 / 31.7 (1.2x slower) | 55.5 / 62.9 (1.1x slower) |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | 48.7 / 77.0 (1.6x slower) | 121.2 / 124.5 (1.0x slower) |
 | AMD Radeon Pro W7500 (HIP) | 9.2 / 14.8 (1.6x slower) | 15.7 / 20.0 (1.3x slower) |
-| Intel Arc Pro B70 (Level-Zero) | 21.1 / 52.6 (2.5x slower) | 47.4 / 85.5 (1.8x slower) |
-| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 1.7 / 6.6 (3.8x slower) | 4.1 / 12.5 (3.0x slower) |
-| Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.8 (13.6x slower) | 0.6 / 7.4 (12.3x slower) |
+| Intel Arc Pro B70 (Level-Zero) | 21.9 / 56.3 (2.6x slower) | 50.4 / 112.3 (2.2x slower) |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 1.7 / 6.6 (3.8x slower) | 4.2 / 12.5 (3.0x slower) |
+| Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.6 (13.4x slower) | 0.6 / 7.6 (12.4x slower) |
 
 *Baseline = plain (non-reproducible) `sycl::reduction` of the same data
 type on the same device. It is a comparison point, not a hard performance
@@ -154,9 +170,9 @@ provide the reproducibility guarantees of `adn::cumsum`.
 | NVIDIA GB10 (CUDA) | 2.364 / 7.606 (3.2x slower) | 3.413 / 14.980 (4.4x slower) |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | 4.855 / 21.383 (4.4x slower) | 6.696 / 40.480 (6.0x slower) |
 | AMD Radeon Pro W7500 (HIP) | 0.751 / 4.876 (6.5x slower) | 1.089 / 9.126 (8.4x slower) |
-| Intel Arc Pro B70 (Level-Zero) | 2.945 / 18.047 (6.1x slower) | 5.806 / 40.862 (7.0x slower) |
-| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 0.167 / 0.610 (3.7x slower) | 0.331 / 2.445 (7.4x slower) |
-| Intel Core Ultra 7 265 CPU (OpenCL) | 0.118 / 1.490 (12.6x slower) | 0.138 / 2.536 (18.4x slower) |
+| Intel Arc Pro B70 (Level-Zero) | 2.906 / 17.714 (6.1x slower) | 5.863 / 40.768 (7.0x slower) |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 0.151 / 0.610 (4.0x slower) | 0.295 / 2.445 (8.3x slower) |
+| Intel Core Ultra 7 265 CPU (OpenCL) | 0.116 / 1.497 (13.0x slower) | 0.137 / 2.566 (18.7x slower) |
 
 *Baseline = oneDPL `inclusive_scan` of the same data type on the same device.
 The slowdown factor is `baseline / cumsum`.
@@ -388,6 +404,13 @@ accumulator logic. Individual options such as
 exposed by a preprocessor macro, so runtime arithmetic probes verify their
 effective device behavior and reject unsafe combinations.
 
+Double scalar conversion uses a volatile running value only in the generic
+SPIR device image. This prevents an observed CPU OpenCL JIT miscompilation of
+non-volatile conversion loops at higher fold counts and small work-groups.
+Native NVIDIA and AMD images, and every float conversion, retain the ordinary
+running value. The strict-FP pragmas remain necessary to prevent contraction
+within an individual update. Both public APIs use this conversion path.
+
 ## Building
 
 ### Prerequisites
@@ -519,8 +542,8 @@ The Google Test suite chooses one preferred backend per distinct device name
 (Level-Zero, then CUDA, then other backends, with OpenCL as the fallback).
 Each correctness case runs once per selected CPU or GPU from a single fat
 binary (CUDA + SPIR-V + AMDGCN by default), plus cross-device bit-identity
-tests and throughput benchmarks. There are 173 correctness cases and 4
-benchmarks per device, plus 10 cross-device cases and one version test: 719
+tests and throughput benchmarks. There are 179 correctness cases and 4
+benchmarks per device, plus 10 cross-device cases and one version test: 743
 tests on a system with three GPUs and one CPU. The `WG_SIZE=1024` cases skip on
 a device whose work-group or local memory limits cannot support that
 configuration.
@@ -535,7 +558,7 @@ configuration.
 | Reproducibility | Multi-run bit-identity, shuffle order-independence, cross-WG_SIZE and selected cross-device/backend consistency |
 | Cumulative sums | Prefix references, three-level tile scan, WG/K matrices, USM bounds, cross-device identity, and repeated-run stress cases |
 | Environment safety | Host FP-mode independence, USM capability checks, shared validation, exception-safe USM cleanup, unsafe device mode rejection |
-| Configurations | K = 2, 3, 4, 5, 6, 8, 12; WG_SIZE = 64, 128, 256, 512, 1024; device- and host-pointer APIs |
+| Configurations | K = 2, 3, 4, 5, 6, 8, 12, 16, 21, 32, 52; WG_SIZE = 2, 4, 64, 128, 256, 512, 1024; device- and host-pointer APIs |
 | Benchmarks | `adn::sum` and `adn::cumsum` throughput on all selected devices (GPU + CPU) |
 
 ```bash
@@ -554,8 +577,10 @@ LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test --gtest_filter="*Float*"
 # Run only CPU tests
 LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test --gtest_filter="CPUs/*"
 
-# Run only benchmarks
-LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test --gtest_filter="*Bench*"
+# Run only benchmarks, three invocations as in the performance tables
+for run in 1 2 3; do
+   GTEST_FILTER='*Bench*' GTEST_OUTPUT="xml:build/benchmark-${run}.xml" make test
+done
 
 # Run only cumulative-sum benchmarks
 LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test \

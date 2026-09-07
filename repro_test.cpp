@@ -2311,6 +2311,121 @@ static void expect_cumsum_matches_sum(sycl::queue &q,
    }
 }
 
+// Each input contains one large cancelling pair, one exactly retained signal,
+// and optional zeros. The magnitude gap makes every prefix reference exact
+// without relying on another binned conversion or on host FP arithmetic.
+template <typename T, int K, int WG_SIZE>
+static void expect_conversion_order(
+   sycl::queue &q, const std::vector<T> &input, T large, T signal) {
+   const sycl::device device = q.get_device();
+   if (device.get_info<sycl::info::device::max_work_group_size>() < WG_SIZE ||
+      device.get_info<sycl::info::device::local_mem_size>() <
+         size_t(WG_SIZE) * sizeof(adn::detail::Binned<T, K>)) {
+      return;
+   }
+   SCOPED_TRACE(
+      "K=" + std::to_string(K) + ", WG_SIZE=" + std::to_string(WG_SIZE));
+   EXPECT_BIT_EQ((adn::sum<K, WG_SIZE>(q, input.data(), input.size())), signal);
+
+   std::vector<T> output(input.size());
+   adn::cumsum<K, WG_SIZE>(q, input.data(), output.data(), input.size());
+   bool positive = false;
+   bool negative = false;
+   bool have_signal = false;
+   for (size_t i = 0; i < input.size(); ++i) {
+      positive |= input[i] == large;
+      negative |= input[i] == -large;
+      have_signal |= input[i] == signal;
+      const T expected = positive == negative ? (have_signal ? signal : T(0))
+                                              : (positive ? large : -large);
+      EXPECT_BIT_EQ(output[i], expected) << "prefix " << i;
+   }
+}
+
+template <typename T, int K>
+static void check_conversion_order(sycl::queue &q, T large, T signal) {
+   const auto check = [&](const std::vector<T> &input) {
+      expect_conversion_order<T, K, 2>(q, input, large, signal);
+      expect_conversion_order<T, K, 4>(q, input, large, signal);
+      expect_conversion_order<T, K, 64>(q, input, large, signal);
+   };
+
+   // Exercise all six permutations, including both scalar-reduction stages.
+   std::vector<T> input{T(-large), signal, large};
+   do {
+      check(input);
+   } while (std::next_permutation(input.begin(), input.end()));
+
+   // Move the same values across work-item, tile, and recursive-scan bounds.
+   input.assign(4113, T(0));
+   input[0] = -large;
+   input[input.size() / 2] = signal;
+   input.back() = large;
+   std::mt19937 rng(719);
+   for (int run = 0; run < 3; ++run) {
+      check(input);
+      std::shuffle(input.begin(), input.end(), rng);
+   }
+}
+
+TEST_P(ADNSumTest, Double_ConversionOrderRegression) {
+   check_conversion_order<double, 16>(queue(), 0x1p80, -0x1.ee747dc415b54p-7);
+   check_conversion_order<double, 32>(queue(), 0x1p800, -0.1);
+   // Cover each scaled-conversion starting index as well as the bottom bins.
+   check_conversion_order<double, 32>(queue(), 0x1p900, -0.1);
+   check_conversion_order<double, 32>(queue(), 0x1p940, -0.1);
+   check_conversion_order<double, 32>(queue(), 0x1p980, -0.1);
+   check_conversion_order<double, 52>(queue(), 0x1p1000, -0.1);
+   check_conversion_order<double, 52>(queue(), 0x1p-960, -0x1.8p-1040);
+}
+
+TEST_P(ADNSumTest, Float_ConversionOrderRegression) {
+   check_conversion_order<float, 21>(queue(), 0x1p100f, -0.1f);
+   check_conversion_order<float, 21>(queue(), 0x1p127f, -0.1f);
+   check_conversion_order<float, 21>(queue(), 0x1p-80f, -0x1.8p-140f);
+}
+
+TEST_P(ADNSumTest, Double_ConversionScaledTermsRegression) {
+   constexpr int K = 52;
+   constexpr int WG_SIZE = 64;
+   const sycl::device device = queue().get_device();
+   if (device.get_info<sycl::info::device::max_work_group_size>() < WG_SIZE ||
+      device.get_info<sycl::info::device::local_mem_size>() <
+         size_t(WG_SIZE) * sizeof(adn::detail::Binned<double, K>)) {
+      GTEST_SKIP() << "Device cannot support the scaled-conversion case";
+   }
+
+   constexpr double smaller = 0x1.3956cfcd39a7fp+971;
+   constexpr double larger = 0x1.afd707f38772cp+1000;
+   // Independently rounded exact sum of the two stored input values.
+   constexpr double total = 0x1.afd707fd52294p+1000;
+   std::mt19937 rng(720);
+   for (size_t n : {size_t(20), size_t(4113)}) {
+      std::vector<double> input(n, 0.0);
+      std::vector<double> output(n);
+      input[6] = smaller;
+      input[19] = larger;
+      for (int run = 0; run < 3; ++run) {
+         SCOPED_TRACE(
+            "N=" + std::to_string(n) + ", run=" + std::to_string(run));
+         EXPECT_BIT_EQ((adn::sum<K, WG_SIZE>(queue(), input.data(), n)), total);
+         adn::cumsum<K, WG_SIZE>(queue(), input.data(), output.data(), n);
+         bool have_smaller = false;
+         bool have_larger = false;
+         for (size_t i = 0; i < n; ++i) {
+            have_smaller |= input[i] == smaller;
+            have_larger |= input[i] == larger;
+            const double expected = have_smaller && have_larger ? total
+               : have_smaller                                   ? smaller
+               : have_larger                                    ? larger
+                                                                : 0.0;
+            EXPECT_BIT_EQ(output[i], expected) << "prefix " << i;
+         }
+         std::shuffle(input.begin(), input.end(), rng);
+      }
+   }
+}
+
 TEST_P(ADNSumTest, Cumsum_EmptyAndInvalidPointers) {
    double output = 7.0;
    EXPECT_NO_THROW(
