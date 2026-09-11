@@ -123,11 +123,6 @@ billions of input elements processed per second, where 1 GElements/s = 10^9
 elements/s. This lets `double` and `float` be compared without the element-size
 bias of GB/s.
 
-The SPIR rows were measured with version `1.2.5`. Native NVIDIA and AMD rows
-retain the published `1.2.4` measurements because their timed sum and
-cumulative-sum machine code is unchanged in `1.2.5`. All rows use `-O3` and
-the toolchains below. The DPC++ builds are pre-release versions. Each binned
-result and its baseline use the same device and toolchain.
 
 | Measured devices | DPC++ / Clang | Compiler revision | oneDPL |
 |---|---|---|---|
@@ -142,9 +137,9 @@ result and its baseline use the same device and toolchain.
 | NVIDIA GB10 (CUDA) | 26.3 / 31.7 (1.2x slower) | 55.5 / 62.9 (1.1x slower) |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | 48.7 / 77.0 (1.6x slower) | 121.2 / 124.5 (1.0x slower) |
 | AMD Radeon Pro W7500 (HIP) | 9.2 / 14.8 (1.6x slower) | 15.7 / 20.0 (1.3x slower) |
-| Intel Arc Pro B70 (Level-Zero) | 21.9 / 56.3 (2.6x slower) | 50.4 / 112.3 (2.2x slower) |
-| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 1.7 / 6.6 (3.8x slower) | 4.2 / 12.5 (3.0x slower) |
-| Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.6 (13.4x slower) | 0.6 / 7.6 (12.4x slower) |
+| Intel Arc Pro B70 (Level-Zero) | 25.3 / 58.3 (2.3x slower) | 56.6 / 99.6 (1.8x slower) |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 1.7 / 6.6 (3.8x slower) | 4.2 / 12.8 (3.0x slower) |
+| Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.6 (13.4x slower) | 0.6 / 7.6 (12.5x slower) |
 
 *Baseline = plain (non-reproducible) `sycl::reduction` of the same data
 type on the same device. It is a comparison point, not a hard performance
@@ -170,9 +165,9 @@ provide the reproducibility guarantees of `adn::cumsum`.
 | NVIDIA GB10 (CUDA) | 2.364 / 7.606 (3.2x slower) | 3.413 / 14.980 (4.4x slower) |
 | NVIDIA RTX PRO 4500 Blackwell (CUDA) | 4.855 / 21.383 (4.4x slower) | 6.696 / 40.480 (6.0x slower) |
 | AMD Radeon Pro W7500 (HIP) | 0.751 / 4.876 (6.5x slower) | 1.089 / 9.126 (8.4x slower) |
-| Intel Arc Pro B70 (Level-Zero) | 2.906 / 17.714 (6.1x slower) | 5.863 / 40.768 (7.0x slower) |
-| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 0.151 / 0.610 (4.0x slower) | 0.295 / 2.445 (8.3x slower) |
-| Intel Core Ultra 7 265 CPU (OpenCL) | 0.116 / 1.497 (13.0x slower) | 0.137 / 2.566 (18.7x slower) |
+| Intel Arc Pro B70 (Level-Zero) | 3.102 / 18.769 (6.1x slower) | 5.975 / 42.408 (7.1x slower) |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 0.151 / 0.610 (4.0x slower) | 0.287 / 2.445 (8.5x slower) |
+| Intel Core Ultra 7 265 CPU (OpenCL) | 0.116 / 1.497 (13.0x slower) | 0.139 / 2.554 (18.4x slower) |
 
 *Baseline = oneDPL `inclusive_scan` of the same data type on the same device.
 The slowdown factor is `baseline / cumsum`.
