@@ -2385,6 +2385,274 @@ TEST_P(ADNSumTest, Float_ConversionOrderRegression) {
    check_conversion_order<float, 21>(queue(), 0x1p-80f, -0x1.8p-140f);
 }
 
+struct FloatConversionCase {
+   std::vector<float> input;
+   std::vector<float> prefixes;
+};
+
+static FloatConversionCase float_conversion_rounding_case(bool spread = false) {
+   // CPU OpenCL conversion used to round the last three prefixes down by
+   // one float ULP with K=21, WG=2, while WG=64 and GPUs rounded up.
+   // These reference values were rounded independently from exact integer
+   // sums: every input is an integer multiple of 2^28. No binned operation
+   // or host floating-point arithmetic is used to compute the references.
+   FloatConversionCase data{
+      {-0x1p+91f, 0x1.ffep+88f, 0x1.ffep+88f, 0x1.ffep+88f, 0x1.ffep+88f,
+         0x1.bp+87f, 0x1.ffep+75f, 0x1.ffep+75f, 0x1.ffep+75f, 0x1.25p+74f,
+         0x1.ffep+62f, 0x1.ffep+62f, 0x1.ffep+62f, 0x1p+52f, 0x1.ffep+49f,
+         0x1.ffep+49f, 0x1.ffep+49f, 0x1.5acp+49f, 0x1.ecp+34f},
+      {-0x1p+91f, -0x1.8008p+90f, -0x1.001p+90f, -0x1.003p+89f, -0x1p+79f,
+         0x1.afp+87f, 0x1.af1ffep+87f, 0x1.af3ffcp+87f, 0x1.af5ffap+87f,
+         0x1.af6922p+87f, 0x1.af6922p+87f, 0x1.af6924p+87f, 0x1.af6924p+87f,
+         0x1.af6924p+87f, 0x1.af6924p+87f, 0x1.af6924p+87f, 0x1.af6926p+87f,
+         0x1.af6926p+87f, 0x1.af6926p+87f}};
+   if (!spread) {
+      return data;
+   }
+
+   // Cross work-item, tile, and recursive-scan boundaries. N also exceeds
+   // the 4096-work-item sum grid for WG=2, exercising its strided input loop.
+   const size_t positions[] = {7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 511, 512,
+      1023, 1024, 2047, 2048, 4095, 4096, 4112};
+   FloatConversionCase padded{
+      std::vector<float>(4113, 0.0f), std::vector<float>(4113)};
+   size_t next = 0;
+   float prefix = 0.0f;
+   for (size_t i = 0; i < padded.input.size(); ++i) {
+      if (next < data.input.size() && i == positions[next]) {
+         padded.input[i] = data.input[next];
+         prefix = data.prefixes[next++];
+      }
+      padded.prefixes[i] = prefix;
+   }
+   return padded;
+}
+
+// Transform only the fixed normal-valued fixture above. Scaling and sign
+// reversal are exact; use integer operations so hostile host FP modes cannot
+// change the test inputs or their independently rounded prefix references.
+static void scale_float_conversion_values(
+   std::vector<float> &values, int scale, bool negate) {
+   for (float &value : values) {
+      const std::uint32_t bits = bits_of(value);
+      const std::uint32_t sign =
+         (bits & UINT32_C(0x80000000)) ^ (negate ? UINT32_C(0x80000000) : 0);
+      const std::uint32_t fraction = bits & UINT32_C(0x007fffff);
+      const int exponent = static_cast<int>((bits >> 23) & 255) + scale;
+      ASSERT_LT(exponent, 255);
+      if (exponent > 0) {
+         value =
+            float_from_bits(sign | (std::uint32_t(exponent) << 23) | fraction);
+      } else {
+         const int shift = 1 - exponent;
+         ASSERT_LT(shift, 24);
+         const std::uint32_t significand = fraction | UINT32_C(0x00800000);
+         ASSERT_EQ(significand & ((UINT32_C(1) << shift) - 1), 0u);
+         value = float_from_bits(sign | (significand >> shift));
+      }
+   }
+}
+
+template <int K, int WG_SIZE>
+static bool supports_float_conversion(const sycl::device &device) {
+   return device.has(sycl::aspect::fp64) &&
+      device.get_info<sycl::info::device::max_work_group_size>() >= WG_SIZE &&
+      device.get_info<sycl::info::device::local_mem_size>() >=
+      size_t(WG_SIZE) * sizeof(adn::detail::Binned<float, K>);
+}
+
+template <int K, int WG_SIZE>
+static void expect_float_conversion(sycl::queue &q,
+   const std::vector<float> &input, const std::vector<float> &expected,
+   bool check_prefix_sums = false) {
+   if (!supports_float_conversion<K, WG_SIZE>(q.get_device())) {
+      return;
+   }
+   SCOPED_TRACE("K=" + std::to_string(K) + ", WG_SIZE=" +
+      std::to_string(WG_SIZE) + ", N=" + std::to_string(input.size()));
+   ASSERT_FALSE(input.empty());
+   ASSERT_EQ(input.size(), expected.size());
+   EXPECT_BIT_EQ(
+      (adn::sum<K, WG_SIZE>(q, input.data(), input.size())), expected.back());
+   std::vector<float> output(input.size());
+   adn::cumsum<K, WG_SIZE>(q, input.data(), output.data(), input.size());
+   expect_bit_identical_arrays(output, expected, "float conversion");
+   if (check_prefix_sums) {
+      for (size_t i = 0; i < input.size(); ++i) {
+         EXPECT_BIT_EQ(
+            (adn::sum<K, WG_SIZE>(q, input.data(), i + 1)), expected[i])
+            << "prefix " << i;
+      }
+   }
+}
+
+template <int WG_SIZE = 2>
+static void check_float_conversion_work_groups(sycl::queue &q,
+   const FloatConversionCase &data, bool check_prefix_sums = false) {
+   expect_float_conversion<21, WG_SIZE>(
+      q, data.input, data.prefixes, check_prefix_sums);
+   if constexpr (WG_SIZE < 1024) {
+      check_float_conversion_work_groups<WG_SIZE * 2>(
+         q, data, check_prefix_sums);
+   }
+}
+
+TEST_P(ADNSumTest, Float_ConversionRoundingRegression) {
+   if (!supports_float_conversion<21, 2>(queue().get_device())) {
+      GTEST_SKIP() << "Device cannot support the float conversion case";
+   }
+   // WG>=32 uses a single sum group for N=19, while smaller work-groups
+   // execute both reduction kernels. Check every scalar prefix independently.
+   check_float_conversion_work_groups(
+      queue(), float_conversion_rounding_case(), true);
+   check_float_conversion_work_groups(
+      queue(), float_conversion_rounding_case(true));
+}
+
+TEST_P(ADNSumTest, Float_ConversionRoundingScaled) {
+   if (!supports_float_conversion<21, 2>(queue().get_device())) {
+      GTEST_SKIP() << "Device cannot support the float conversion case";
+   }
+   // Include subnormal inputs, different bin alignments, and compressed bin 0.
+   // All scaled inputs and references remain exact and finite at these scales.
+   for (int scale : {-167, -39, 0, 30, 36}) {
+      for (bool negate : {false, true}) {
+         SCOPED_TRACE("scale=" + std::to_string(scale) +
+            ", negate=" + std::to_string(negate));
+         auto data = float_conversion_rounding_case();
+         scale_float_conversion_values(data.input, scale, negate);
+         scale_float_conversion_values(data.prefixes, scale, negate);
+         check_float_conversion_work_groups(queue(), data, true);
+      }
+   }
+}
+
+TEST_P(ADNSumTest, Float_ConversionRoundingShuffled) {
+   if (!supports_float_conversion<21, 64>(queue().get_device())) {
+      GTEST_SKIP() << "Device cannot support the float conversion case";
+   }
+   auto data = float_conversion_rounding_case();
+   const float expected_sum = data.prefixes.back();
+   std::mt19937 rng(7551);
+   for (int run = 0; run <= 10; ++run) {
+      SCOPED_TRACE("run=" + std::to_string(run));
+      if (run != 0) {
+         std::shuffle(data.input.begin(), data.input.end(), rng);
+         adn::cumsum<21, 64>(queue(), data.input.data(), data.prefixes.data(),
+            data.input.size());
+      }
+      // Shuffling changes intermediate prefixes, but never the total.
+      EXPECT_BIT_EQ(data.prefixes.back(), expected_sum);
+      check_float_conversion_work_groups(queue(), data);
+   }
+}
+
+TEST_P(ADNSumTest, Float_ConversionRoundingPrefixPermutations) {
+   if (!supports_float_conversion<21, 64>(queue().get_device())) {
+      GTEST_SKIP() << "Device cannot support the float conversion case";
+   }
+   auto data = float_conversion_rounding_case();
+   const auto original_prefixes = data.prefixes;
+   const size_t ends[] = {8, 17, 19};
+   std::mt19937 rng(7552);
+   for (int run = 0; run < 10; ++run) {
+      SCOPED_TRACE("run=" + std::to_string(run));
+      size_t begin = 0;
+      for (size_t end : ends) {
+         std::shuffle(
+            data.input.begin() + begin, data.input.begin() + end, rng);
+         begin = end;
+      }
+      adn::cumsum<21, 64>(
+         queue(), data.input.data(), data.prefixes.data(), data.input.size());
+      // Each boundary retains exactly the same input multiset. In particular,
+      // prefix 16 is the first independently known rounding regression.
+      for (size_t end : ends) {
+         EXPECT_BIT_EQ(data.prefixes[end - 1], original_prefixes[end - 1])
+            << "prefix " << end - 1;
+      }
+      check_float_conversion_work_groups(queue(), data);
+   }
+}
+
+template <int K = 2> static void check_float_conversion_folds(sycl::queue &q) {
+   const auto original = float_conversion_rounding_case();
+   auto data = original;
+   float expected_sum = 0.0f;
+   std::mt19937 rng(7553);
+   for (int run = 0; run < 3; ++run) {
+      SCOPED_TRACE("K=" + std::to_string(K) + ", run=" + std::to_string(run));
+      adn::cumsum<K, 64>(
+         q, data.input.data(), data.prefixes.data(), data.input.size());
+      if (run == 0) {
+         expected_sum = data.prefixes.back();
+      }
+      EXPECT_BIT_EQ(data.prefixes.back(), expected_sum);
+      if constexpr (K >= 6) {
+         // Six folds retain every bit of this fixture. Smaller folds may
+         // absorb its low terms; they must still agree across WG sizes/APIs.
+         EXPECT_BIT_EQ(data.prefixes.back(), original.prefixes.back());
+         if (run == 0) {
+            expect_bit_identical_arrays(
+               data.prefixes, original.prefixes, "exact original prefixes");
+         }
+      }
+      expect_float_conversion<K, 2>(q, data.input, data.prefixes, true);
+      expect_float_conversion<K, 64>(q, data.input, data.prefixes, true);
+      std::shuffle(data.input.begin(), data.input.end(), rng);
+   }
+   if constexpr (K < 21) {
+      check_float_conversion_folds<K + 1>(q);
+   }
+}
+
+TEST_P(ADNSumTest, Float_ConversionRoundingFoldMatrix) {
+   if (!supports_float_conversion<21, 64>(queue().get_device())) {
+      GTEST_SKIP() << "Device cannot support the float conversion case";
+   }
+   check_float_conversion_folds(queue());
+}
+
+template <int WG_SIZE>
+static void check_float_conversion_in_place(
+   sycl::queue &q, const FloatConversionCase &data) {
+   SCOPED_TRACE("WG_SIZE=" + std::to_string(WG_SIZE) +
+      ", N=" + std::to_string(data.input.size()));
+   auto host = data.input;
+   adn::cumsum<21, WG_SIZE>(q, host.data(), host.data(), host.size());
+   expect_bit_identical_arrays(host, data.prefixes, "host in-place");
+
+   auto owner = adn::detail::allocate_device_usm<float>(data.input.size(), q);
+   const size_t bytes = data.input.size() * sizeof(float);
+   q.memcpy(owner.get(), data.input.data(), bytes).wait_and_throw();
+   EXPECT_BIT_EQ((adn::sum<21, WG_SIZE>(q, owner.get(), data.input.size())),
+      data.prefixes.back());
+   adn::cumsum<21, WG_SIZE>(q, owner.get(), owner.get(), data.input.size());
+   q.memcpy(host.data(), owner.get(), bytes).wait_and_throw();
+   expect_bit_identical_arrays(host, data.prefixes, "device in-place");
+}
+
+TEST_P(ADNSumTest, Float_ConversionRoundingInPlace) {
+   if (!supports_float_conversion<21, 64>(queue().get_device())) {
+      GTEST_SKIP() << "Device cannot support the float conversion case";
+   }
+   for (bool spread : {false, true}) {
+      auto data = float_conversion_rounding_case(spread);
+      std::mt19937 rng(7554);
+      for (int run = 0; run < 3; ++run) {
+         SCOPED_TRACE("run=" + std::to_string(run));
+         if (run != 0) {
+            std::shuffle(data.input.begin(), data.input.end(), rng);
+            adn::cumsum<21, 64>(queue(), data.input.data(),
+               data.prefixes.data(), data.input.size());
+            EXPECT_BIT_EQ(data.prefixes.back(), 0x1.af6926p+87f);
+         }
+         check_float_conversion_in_place<2>(queue(), data);
+         check_float_conversion_in_place<64>(queue(), data);
+      }
+   }
+}
+
 TEST_P(ADNSumTest, Double_ConversionScaledTermsRegression) {
    constexpr int K = 52;
    constexpr int WG_SIZE = 64;
@@ -3396,6 +3664,56 @@ TEST_F(ADNSumCrossDevice, Cumsum_Float) {
    input[2047] = std::numeric_limits<float>::denorm_min();
    input[2048] = -std::numeric_limits<float>::denorm_min();
    expect_cumsum_identical(input);
+}
+
+TEST_F(ADNSumCrossDevice, Float_ConversionRounding) {
+   const auto &devices = all_devices();
+   const auto supported = std::count_if(
+      devices.begin(), devices.end(), [](const sycl::device &device) {
+      return supports_float_conversion<21, 64>(device);
+   });
+   if (supported < 2) {
+      GTEST_SKIP() << "fewer than two supported devices available";
+   }
+
+   for (bool spread : {false, true}) {
+      auto data = float_conversion_rounding_case(spread);
+      std::mt19937 rng(7555);
+      for (int run = 0; run < 3; ++run) {
+         SCOPED_TRACE("N=" + std::to_string(data.input.size()) +
+            ", run=" + std::to_string(run));
+         std::vector<float> reference;
+         std::string reference_name;
+         for (const auto &device : devices) {
+            if (!supports_float_conversion<21, 64>(device)) {
+               continue;
+            }
+            const auto name = device.get_info<sycl::info::device::name>();
+            SCOPED_TRACE(name);
+            sycl::queue q(device);
+            std::vector<float> output(data.input.size());
+            adn::cumsum<21, 64>(
+               q, data.input.data(), output.data(), data.input.size());
+            EXPECT_BIT_EQ(output.back(), 0x1.af6926p+87f);
+            if (run == 0) {
+               expect_bit_identical_arrays(
+                  output, data.prefixes, "independent original prefixes");
+            }
+            if (reference.empty()) {
+               reference = output;
+               reference_name = name;
+            } else {
+               expect_bit_identical_arrays(
+                  output, reference, name + " vs " + reference_name);
+            }
+            expect_float_conversion<21, 2>(q, data.input, reference);
+            expect_float_conversion<21, 64>(q, data.input, reference);
+         }
+         // Use exactly the same permutation on every device. Only outputs
+         // whose prefixes contain the same values can be compared directly.
+         std::shuffle(data.input.begin(), data.input.end(), rng);
+      }
+   }
 }
 
 TEST_F(ADNSumCrossDevice, Cumsum_ShuffledCancellationFullArray) {

@@ -406,12 +406,12 @@ accumulator logic. Individual options such as
 exposed by a preprocessor macro, so runtime arithmetic probes verify their
 effective device behavior and reject unsafe combinations.
 
-Double scalar conversion uses a volatile running value only in the generic
-SPIR device image. This prevents an observed CPU OpenCL JIT miscompilation of
-non-volatile conversion loops at higher fold counts and small work-groups.
-Native NVIDIA and AMD images, and every float conversion, retain the ordinary
-running value. The strict-FP pragmas remain necessary to prevent contraction
-within an individual update. Both public APIs use this conversion path.
+Scalar conversion uses a volatile double running value for both float and
+double results in the generic SPIR device image. This prevents observed CPU
+OpenCL JIT miscompilations of conversion loops at higher fold counts and small
+work-groups. Native NVIDIA and AMD images retain the ordinary running value.
+The strict-FP pragmas remain necessary to prevent contraction within an
+individual update. Both public APIs use this conversion path.
 
 ## Building
 
@@ -544,8 +544,8 @@ The Google Test suite chooses one preferred backend per distinct device name
 (Level-Zero, then CUDA, then other backends, with OpenCL as the fallback).
 Each correctness case runs once per selected CPU or GPU from a single fat
 binary (CUDA + SPIR-V + AMDGCN by default), plus cross-device bit-identity
-tests and throughput benchmarks. There are 179 correctness cases and 4
-benchmarks per device, plus 10 cross-device cases and one version test: 743
+tests and throughput benchmarks. There are 185 correctness cases and 4
+benchmarks per device, plus 11 cross-device cases and one version test: 768
 tests on a system with three GPUs and one CPU. The `WG_SIZE=1024` cases skip on
 a device whose work-group or local memory limits cannot support that
 configuration.
@@ -560,7 +560,8 @@ configuration.
 | Reproducibility | Multi-run bit-identity, shuffle order-independence, cross-WG_SIZE and selected cross-device/backend consistency |
 | Cumulative sums | Prefix references, three-level tile scan, WG/K matrices, USM bounds, cross-device identity, and repeated-run stress cases |
 | Environment safety | Host FP-mode independence, USM capability checks, shared validation, exception-safe USM cleanup, unsafe device mode rejection |
-| Configurations | K = 2, 3, 4, 5, 6, 8, 12, 16, 21, 32, 52; WG_SIZE = 2, 4, 64, 128, 256, 512, 1024; device- and host-pointer APIs |
+| Conversion regressions | Independent prefix references, signed/scaled rounding boundaries, all float folds, shuffles, in-place scans, and cross-device identity |
+| Configurations | Float K = 2-21; selected double K up to 52; every power-of-two WG_SIZE from 2 to 1024 where supported; device- and host-pointer APIs |
 | Benchmarks | `adn::sum` and `adn::cumsum` throughput on all selected devices (GPU + CPU) |
 
 ```bash

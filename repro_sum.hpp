@@ -77,7 +77,7 @@
 /// @{
 #define SYCL_REPRO_SUM_VERSION_MAJOR 1
 #define SYCL_REPRO_SUM_VERSION_MINOR 2
-#define SYCL_REPRO_SUM_VERSION_PATCH 5
+#define SYCL_REPRO_SUM_VERSION_PATCH 6
 #define SYCL_REPRO_SUM_VERSION                                                 \
    (SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +                                     \
       SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH)
@@ -609,9 +609,9 @@ inline void merge(Binned<T, K> &y, const Binned<T, K> &x) {
  * rescales near-overflow indices; the float flavour accumulates in
  * double, which provides the necessary headroom directly.
  *
- * Some CPU OpenCL runtimes miscompile the double conversion after consuming
- * generic SPIR. Make each update observable in that device image; native
- * NVIDIA and AMD targets retain the ordinary running value and code path.
+ * Some CPU OpenCL runtimes miscompile float and double conversion after
+ * consuming generic SPIR. Make each update observable in that device image;
+ * native NVIDIA and AMD targets retain the ordinary running value and path.
  */
 template <typename T, int K> inline T conv(const Binned<T, K> &a) {
    SYCL_REPRO_SUM_DETAIL_STRICT_FP
@@ -625,7 +625,11 @@ template <typename T, int K> inline T conv(const Binned<T, K> &a) {
    const int xi = accum_index(a);
 
    if constexpr (std::is_same_v<T, float>) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+      volatile double Y = 0.0;
+#else
       double Y = 0.0;
+#endif
       int i;
       if (xi == 0) {
          Y += double(a.car[0]) * (double(bin_value<float>(0)) / 6.0) *
