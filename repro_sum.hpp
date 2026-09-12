@@ -72,12 +72,12 @@
 /// SYCL_REPRO_SUM_VERSION encodes MAJOR * 10000 + MINOR * 100 + PATCH,
 /// so version checks can be done with a single comparison:
 /// @code
-///   #if SYCL_REPRO_SUM_VERSION >= 10200  // require >= 1.2.0
+///   #if SYCL_REPRO_SUM_VERSION >= 10300  // require >= 1.3.0
 /// @endcode
 /// @{
 #define SYCL_REPRO_SUM_VERSION_MAJOR 1
-#define SYCL_REPRO_SUM_VERSION_MINOR 2
-#define SYCL_REPRO_SUM_VERSION_PATCH 6
+#define SYCL_REPRO_SUM_VERSION_MINOR 3
+#define SYCL_REPRO_SUM_VERSION_PATCH 0
 #define SYCL_REPRO_SUM_VERSION                                                 \
    (SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +                                     \
       SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH)
@@ -102,6 +102,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -755,6 +756,38 @@ inline sycl::event submit_or_wait_on_error(
    }
 }
 
+constexpr size_t DEFAULT_MAX_SUM_GROUPS = 2048;
+constexpr size_t INTEL_GPU_MAX_SUM_GROUPS = 256;
+
+inline bool is_intel_gpu_sum_grid_device(
+   sycl::backend backend, const sycl::device &device) {
+   const bool supported_backend =
+      backend == sycl::backend::ext_oneapi_level_zero ||
+      backend == sycl::backend::opencl;
+   return supported_backend && device.is_gpu() &&
+      device.get_info<sycl::info::device::vendor_id>() == UINT32_C(0x8086);
+}
+
+/**
+ * @brief Select the reduction grid size for a sum invocation.
+ *
+ * Intel GPUs exposed through Level Zero or OpenCL are faster with a smaller
+ * persistent grid for the default specialization.  Other devices and custom
+ * specializations retain the original limit.
+ */
+template <int K, int WG_SIZE>
+inline size_t sum_group_count(
+   size_t groups_needed, bool use_reduced_intel_gpu_grid) {
+   size_t max_groups = DEFAULT_MAX_SUM_GROUPS;
+   if constexpr (K == 3 && WG_SIZE == 256) {
+      if (groups_needed > DEFAULT_MAX_SUM_GROUPS &&
+         use_reduced_intel_gpu_grid) {
+         max_groups = INTEL_GPU_MAX_SUM_GROUPS;
+      }
+   }
+   return groups_needed < max_groups ? groups_needed : max_groups;
+}
+
 /**
  * @brief Single-pass input kernel plus device-side final reduction.
  *
@@ -775,16 +808,19 @@ inline sycl::event submit_or_wait_on_error(
  */
 template <typename T, int K, int WG_SIZE>
 T sum_impl(sycl::queue &q, const T *d_arr, size_t N,
-   const std::vector<sycl::event> &dependencies) {
+   const std::vector<sycl::event> &dependencies, sycl::backend backend,
+   bool use_reduced_intel_gpu_grid) {
    SYCL_REPRO_SUM_DETAIL_STRICT_FP
    using Acc = Binned<T, K>;
 
-   constexpr size_t MAX_GROUPS = 2048;
    const size_t groups_needed = (N + WG_SIZE - 1) / WG_SIZE;
    const size_t num_groups =
-      groups_needed < MAX_GROUPS ? groups_needed : MAX_GROUPS;
+      sum_group_count<K, WG_SIZE>(groups_needed, use_reduced_intel_gpu_grid);
 
-   auto partial_owner = allocate_shared_usm<Acc>(num_groups, q);
+   const bool use_device_partials = backend == sycl::backend::ext_oneapi_cuda;
+   auto partial_owner = use_device_partials
+      ? allocate_device_usm<Acc>(num_groups, q)
+      : allocate_shared_usm<Acc>(num_groups, q);
    Acc *d_partial = partial_owner.get();
 
    sycl::event partials_ready = q.submit([&](sycl::handler &h) {
@@ -830,8 +866,9 @@ T sum_impl(sycl::queue &q, const T *d_arr, size_t N,
          sycl::nd_range<1>(num_groups * WG_SIZE, WG_SIZE), accumulate_partial);
    });
 
+   sycl::event result_ready = partials_ready;
    if (num_groups > 1) {
-      sycl::event result_ready = submit_or_wait_on_error(partials_ready, [&] {
+      result_ready = submit_or_wait_on_error(partials_ready, [&] {
          return q.submit([&](sycl::handler &h) {
             h.depends_on(partials_ready);
             sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
@@ -863,13 +900,20 @@ T sum_impl(sycl::queue &q, const T *d_arr, size_t N,
             h.parallel_for(sycl::nd_range<1>(WG_SIZE, WG_SIZE), finalize);
          });
       });
-      result_ready.wait_and_throw();
-   } else {
-      partials_ready.wait_and_throw();
    }
 
-   const T result = from_bits<T>(to_bits(d_partial[0].pri[0]));
-   return result;
+   if (use_device_partials) {
+      T result;
+      sycl::event copied = submit_or_wait_on_error(result_ready, [&] {
+         return q.memcpy(
+            &result, &d_partial[0].pri[0], sizeof(T), {result_ready});
+      });
+      copied.wait_and_throw();
+      return from_bits<T>(to_bits(result));
+   }
+
+   result_ready.wait_and_throw();
+   return from_bits<T>(to_bits(d_partial[0].pri[0]));
 }
 
 /**
@@ -975,66 +1019,80 @@ void binned_exclusive_scan(
  * This keeps temporary storage proportional to the number of tiles instead
  * of storing a full binned accumulator for every output element.
  */
-template <typename T, int K, int WG_SIZE>
-void cumsum_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N,
-   const std::vector<sycl::event> &dependencies) {
+template <size_t ITEMS_PER_WORK_ITEM, typename T, int K, int WG_SIZE>
+void cumsum_tiled_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N,
+   const std::vector<sycl::event> &dependencies, sycl::backend backend) {
    SYCL_REPRO_SUM_DETAIL_STRICT_FP
    using Acc = Binned<T, K>;
 
-   constexpr size_t ITEMS_PER_WORK_ITEM = 8;
+   static_assert(ITEMS_PER_WORK_ITEM > 0,
+      "cumsum tile must contain at least one item per work-item");
    constexpr size_t TILE_SIZE = size_t(WG_SIZE) * ITEMS_PER_WORK_ITEM;
    const size_t num_tiles = (N + TILE_SIZE - 1) / TILE_SIZE;
+   const bool use_single_tile_fast_path = num_tiles == 1 &&
+      (backend == sycl::backend::ext_oneapi_cuda ||
+         backend == sycl::backend::ext_oneapi_level_zero);
 
-   auto totals_owner = allocate_device_usm<Acc>(num_tiles, q);
-   auto prefixes_owner = allocate_device_usm<Acc>(num_tiles, q);
-   Acc *tile_totals = totals_owner.get();
-   Acc *tile_prefixes = prefixes_owner.get();
+   std::optional<UsmUniquePtr<Acc>> totals_owner;
+   std::optional<UsmUniquePtr<Acc>> prefixes_owner;
+   Acc *tile_prefixes = nullptr;
 
-   q.submit([&](sycl::handler &h) {
-      if (!dependencies.empty()) {
-         h.depends_on(dependencies);
-      }
-      sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
+   if (!use_single_tile_fast_path) {
+      totals_owner.emplace(allocate_device_usm<Acc>(num_tiles, q));
+      prefixes_owner.emplace(allocate_device_usm<Acc>(num_tiles, q));
+      Acc *tile_totals = totals_owner->get();
+      tile_prefixes = prefixes_owner->get();
 
-      auto compute_tile_totals = [=](sycl::nd_item<1> item) {
-         const size_t tile = item.get_group(0);
-         const size_t lid = item.get_local_id(0);
-         const size_t begin = tile * TILE_SIZE + lid * ITEMS_PER_WORK_ITEM;
-
-         Acc acc{};
-         int e_threshold = -1;
-         int since_renorm = 0;
-         for (size_t j = 0; j < ITEMS_PER_WORK_ITEM; ++j) {
-            const size_t i = begin + j;
-            if (i < N) {
-               accumulate(acc, e_threshold, since_renorm, d_input[i]);
-            }
+      q.submit([&](sycl::handler &h) {
+         if (!dependencies.empty()) {
+            h.depends_on(dependencies);
          }
-         renorm(acc);
+         sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
 
-         loc[lid] = acc;
-         sycl::group_barrier(item.get_group());
+         auto compute_tile_totals = [=](sycl::nd_item<1> item) {
+            const size_t tile = item.get_group(0);
+            const size_t lid = item.get_local_id(0);
+            const size_t begin = tile * TILE_SIZE + lid * ITEMS_PER_WORK_ITEM;
 
-         for (size_t offset = WG_SIZE / 2; offset > 0; offset >>= 1) {
-            if (lid < offset) {
-               Acc lhs = loc[lid];
-               merge(lhs, loc[lid + offset]);
-               loc[lid] = lhs;
+            Acc acc{};
+            int e_threshold = -1;
+            int since_renorm = 0;
+            for (size_t j = 0; j < ITEMS_PER_WORK_ITEM; ++j) {
+               const size_t i = begin + j;
+               if (i < N) {
+                  accumulate(acc, e_threshold, since_renorm, d_input[i]);
+               }
             }
+            renorm(acc);
+
+            loc[lid] = acc;
             sycl::group_barrier(item.get_group());
-         }
 
-         if (lid == 0) {
-            tile_totals[tile] = loc[0];
-         }
-      };
+            for (size_t offset = WG_SIZE / 2; offset > 0; offset >>= 1) {
+               if (lid < offset) {
+                  Acc lhs = loc[lid];
+                  merge(lhs, loc[lid + offset]);
+                  loc[lid] = lhs;
+               }
+               sycl::group_barrier(item.get_group());
+            }
 
-      h.parallel_for(
-         sycl::nd_range<1>(num_tiles * WG_SIZE, WG_SIZE), compute_tile_totals);
-   }).wait_and_throw();
+            if (lid == 0) {
+               tile_totals[tile] = loc[0];
+            }
+         };
 
-   binned_exclusive_scan<T, K, WG_SIZE>(
-      q, tile_totals, tile_prefixes, num_tiles);
+         h.parallel_for(sycl::nd_range<1>(num_tiles * WG_SIZE, WG_SIZE),
+            compute_tile_totals);
+      }).wait_and_throw();
+
+      binned_exclusive_scan<T, K, WG_SIZE>(
+         q, tile_totals, tile_prefixes, num_tiles);
+   } else {
+      prefixes_owner.emplace(allocate_device_usm<Acc>(1, q));
+      tile_prefixes = prefixes_owner->get();
+      q.memset(tile_prefixes, 0, sizeof(Acc), dependencies).wait_and_throw();
+   }
 
    q.submit([&](sycl::handler &h) {
       sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
@@ -1111,6 +1169,40 @@ void cumsum_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N,
    }).wait_and_throw();
 }
 
+template <typename T, int K, int WG_SIZE>
+void cumsum_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N,
+   const std::vector<sycl::event> &dependencies, sycl::backend backend) {
+   cumsum_tiled_impl<8, T, K, WG_SIZE>(
+      q, d_input, d_output, N, dependencies, backend);
+}
+
+/**
+ * @brief Select the generic large-input tile and compute cumulative sums.
+ *
+ * Larger contiguous chunks amortize work-group scans and the recursive scan
+ * of tile totals. The selection depends only on the input size and template
+ * parameters; smaller inputs and custom specializations retain the original
+ * eight-item tile shape.
+ */
+template <typename T, int K, int WG_SIZE>
+void cumsum_dispatch_impl(sycl::queue &q, const T *d_input, T *d_output,
+   size_t N, const std::vector<sycl::event> &dependencies,
+   sycl::backend backend) {
+   if constexpr (K == 3 && WG_SIZE == 256) {
+      constexpr size_t BASE_ITEMS_PER_WORK_ITEM = 8;
+      constexpr size_t WIDE_TILE_MIN_BASE_TILES = size_t(1) << 15;
+      constexpr size_t WIDE_TILE_MIN_INPUT =
+         size_t(WG_SIZE) * BASE_ITEMS_PER_WORK_ITEM * WIDE_TILE_MIN_BASE_TILES;
+      if (N >= WIDE_TILE_MIN_INPUT) {
+         cumsum_tiled_impl<16, T, K, WG_SIZE>(
+            q, d_input, d_output, N, dependencies, backend);
+         return;
+      }
+   }
+
+   cumsum_impl<T, K, WG_SIZE>(q, d_input, d_output, N, dependencies, backend);
+}
+
 /**
  * @brief Runtime values and results for the device floating-point probe.
  */
@@ -1135,6 +1227,13 @@ template <typename T> struct EnvironmentProbeData {
 
 template <int K, int WG_SIZE> struct SumSpecialization {};
 template <int K, int WG_SIZE> struct CumsumSpecialization {};
+
+template <typename Specialization>
+struct UsesReducedIntelGpuSumGrid : std::false_type {};
+
+template <>
+struct UsesReducedIntelGpuSumGrid<SumSpecialization<3, 256>> : std::true_type {
+};
 
 template <typename T, typename Specialization = void>
 class EnvironmentProbeKernel;
@@ -1286,6 +1385,7 @@ struct DeviceValidationSlot {
    sycl::backend backend;
    sycl::device device;
    std::once_flag once;
+   bool use_reduced_intel_gpu_sum_grid = false;
 
    DeviceValidationSlot(
       sycl::backend backend_value, const sycl::device &device_value)
@@ -1327,32 +1427,48 @@ inline DeviceValidationSlot<T, Specialization> *find_device_validation_slot(
  * @brief Validate and cache one backend/device/type/operation combination.
  */
 template <typename T, typename Specialization = void>
-inline void validate_device_environment(sycl::queue &q) {
-   const sycl::backend backend = q.get_backend();
+inline DeviceValidationSlot<T, Specialization> *validate_device_environment(
+   sycl::queue &q, sycl::backend backend) {
    const sycl::device device = q.get_device();
    DeviceValidationSlot<T, Specialization> *slot =
       find_device_validation_slot<T, Specialization>(backend, device);
    auto validate = [&] {
       validate_device_capabilities<T>(device);
       run_device_environment_probe<T, Specialization>(q);
+      if constexpr (std::is_same_v<T, double> &&
+         UsesReducedIntelGpuSumGrid<Specialization>::value) {
+         if (slot != nullptr) {
+            slot->use_reduced_intel_gpu_sum_grid =
+               is_intel_gpu_sum_grid_device(backend, device);
+         }
+      }
    };
 
    if (slot == nullptr) {
       // Dynamically created sub-devices are not part of root enumeration.
       // Validate them on every use rather than caching them unsafely.
       validate();
-      return;
+      return nullptr;
    }
    std::call_once(slot->once, validate);
+   return slot;
 }
 
 template <typename T, typename Specialization = void>
-inline void validate_environment_for(sycl::queue &q) {
+inline sycl::backend validate_environment_for(
+   sycl::queue &q, bool *use_reduced_intel_gpu_sum_grid = nullptr) {
    validate_fp_type<T>();
-   validate_device_environment<double, Specialization>(q);
+   const sycl::backend backend = q.get_backend();
+   DeviceValidationSlot<double, Specialization> *slot =
+      validate_device_environment<double, Specialization>(q, backend);
    if constexpr (std::is_same_v<T, float>) {
-      validate_device_environment<float, Specialization>(q);
+      validate_device_environment<float, Specialization>(q, backend);
    }
+   if (use_reduced_intel_gpu_sum_grid != nullptr) {
+      *use_reduced_intel_gpu_sum_grid =
+         slot != nullptr && slot->use_reduced_intel_gpu_sum_grid;
+   }
+   return backend;
 }
 
 } // namespace detail
@@ -1444,9 +1560,10 @@ template <typename T, int K, int WG_SIZE> constexpr void validate_params() {
  * @note Both float and double sums require device fp64 support because the
  *       final float conversion accumulates in double precision.
  *
- * @note Every nonempty sum requires shared USM support for internal
- *       accumulators.  Plain host pointers additionally require device USM
- *       support for the temporary input allocation.
+ * @note Every nonempty sum requires shared USM support for environment
+ *       validation.  CUDA reduction partials use device USM; other backends
+ *       use shared USM.  Plain host pointers additionally require device USM
+ *       for the temporary input allocation.
  *
  * @note NaN inputs and sums containing both +Inf and -Inf return a fixed
  *       positive quiet NaN (0x7fc00000 for float, 0x7ff8000000000000 for
@@ -1474,8 +1591,9 @@ T sum(sycl::queue &q, const T *arr, size_t N,
       throw std::invalid_argument(
          "adn::sum requires a non-null pointer when N is nonzero");
    }
-   detail::validate_environment_for<T, detail::SumSpecialization<K, WG_SIZE>>(
-      q);
+   bool use_reduced_intel_gpu_grid = false;
+   const sycl::backend backend = detail::validate_environment_for<T,
+      detail::SumSpecialization<K, WG_SIZE>>(q, &use_reduced_intel_gpu_grid);
    detail::validate_work_group_capacity<T, K, WG_SIZE>(q.get_device());
 
    // If the pointer was allocated by SYCL (device/shared/host USM),
@@ -1483,13 +1601,15 @@ T sum(sycl::queue &q, const T *arr, size_t N,
    // device memory, copy, compute, and free.
    auto ptr_type = sycl::get_pointer_type(arr, q.get_context());
    if (ptr_type != sycl::usm::alloc::unknown) {
-      return detail::sum_impl<T, K, WG_SIZE>(q, arr, N, dependencies);
+      return detail::sum_impl<T, K, WG_SIZE>(
+         q, arr, N, dependencies, backend, use_reduced_intel_gpu_grid);
    }
 
    auto device_owner = detail::allocate_device_usm<T>(N, q);
    T *d_arr = device_owner.get();
    q.memcpy(d_arr, arr, N * sizeof(T), dependencies).wait_and_throw();
-   return detail::sum_impl<T, K, WG_SIZE>(q, d_arr, N, dependencies);
+   return detail::sum_impl<T, K, WG_SIZE>(
+      q, d_arr, N, dependencies, backend, use_reduced_intel_gpu_grid);
 }
 
 /**
@@ -1561,7 +1681,7 @@ void cumsum(sycl::queue &q, const T *input, T *output, size_t N,
       throw std::invalid_argument(
          "adn::cumsum requires non-null pointers when N is nonzero");
    }
-   detail::validate_environment_for<T,
+   const sycl::backend backend = detail::validate_environment_for<T,
       detail::CumsumSpecialization<K, WG_SIZE>>(q);
    detail::validate_work_group_capacity<T, K, WG_SIZE>(q.get_device());
    detail::validate_device_usm_capability(q.get_device());
@@ -1573,7 +1693,8 @@ void cumsum(sycl::queue &q, const T *input, T *output, size_t N,
    const size_t bytes = N * sizeof(T);
 
    if (input_is_usm && output_is_usm) {
-      detail::cumsum_impl<T, K, WG_SIZE>(q, input, output, N, dependencies);
+      detail::cumsum_dispatch_impl<T, K, WG_SIZE>(
+         q, input, output, N, dependencies, backend);
       return;
    }
 
@@ -1581,8 +1702,8 @@ void cumsum(sycl::queue &q, const T *input, T *output, size_t N,
       auto device_owner = detail::allocate_device_usm<T>(N, q);
       T *device_data = device_owner.get();
       q.memcpy(device_data, input, bytes, dependencies).wait_and_throw();
-      detail::cumsum_impl<T, K, WG_SIZE>(
-         q, device_data, device_data, N, dependencies);
+      detail::cumsum_dispatch_impl<T, K, WG_SIZE>(
+         q, device_data, device_data, N, dependencies, backend);
       q.memcpy(output, device_data, bytes).wait_and_throw();
       return;
    }
@@ -1605,8 +1726,8 @@ void cumsum(sycl::queue &q, const T *input, T *output, size_t N,
       device_output = output_owner.get();
    }
 
-   detail::cumsum_impl<T, K, WG_SIZE>(
-      q, device_input, device_output, N, dependencies);
+   detail::cumsum_dispatch_impl<T, K, WG_SIZE>(
+      q, device_input, device_output, N, dependencies, backend);
 
    if (!output_is_usm) {
       q.memcpy(output, output_owner.get(), bytes).wait_and_throw();

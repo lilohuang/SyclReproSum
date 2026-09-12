@@ -130,22 +130,80 @@ bias of GB/s.
 | Intel Arc Pro B70 | 7.1.0 / 23 | `95ec82a14309` | 2022.13.0 |
 | RTX PRO 4500, W7500, Core Ultra 7 265 CPU and iGPU | 7.2.0 / 24 | `f3aadb6ba275` | 2022.13.0 |
 
+Once a default cumulative sum would require at least 32K of the original tiles
+(about 67M elements), every device uses 16 contiguous elements per work-item
+to reduce the number of tile totals and amortize the work-group scans. This
+rule depends only on `N`, `K`, and `WG_SIZE`, never on a backend, vendor, model,
+or device property. Smaller inputs and custom configurations retain the
+previous path. The transformation merges binned accumulators without
+reassociating scalar additions, so the reproducibility contract is unchanged.
+
+### Small-N latency
+
+The small-N baselines match the 100M throughput benchmarks: a plain
+non-reproducible `sycl::reduction` for `sum`, and oneDPL `inclusive_scan` for
+`cumsum`. For each N, both algorithms get three warmup calls followed by 201
+synchronous calls in alternating baseline/ADN order. A test reports the
+median call latency, and the tables report the median of five separate
+test-binary invocations. Inputs and cumulative-sum outputs use device USM;
+the scalar baseline uses the same shared-USM result as the 100M benchmark.
+Allocation, initial data transfer, and warmup are outside the timed region.
+Internal ADN allocation and synchronization remain included.
+
+Each cell is `ADN / baseline` in microseconds, followed by ADN's relative
+performance. The defaults `K=3` and `WG_SIZE=256` are used throughout. A
+version-to-version A/B is useful as a regression check, but is not an
+algorithm baseline and is therefore not reported here.
+
+#### Scalar-sum latency on CUDA
+
+| Device / type | N=1 | N=64 | N=1,024 | N=2,048 | N=2,049 |
+|---|---:|---:|---:|---:|---:|
+| NVIDIA GB10 (CUDA), `double` | 17.6 / 25.0 (1.42x faster) | 24.6 / 23.2 (1.06x slower) | 28.7 / 32.9 (1.15x faster) | 28.8 / 42.2 (1.46x faster) | 29.1 / 41.9 (1.44x faster) |
+| NVIDIA GB10 (CUDA), `float` | 16.9 / 23.2 (1.37x faster) | 24.8 / 23.5 (1.05x slower) | 28.6 / 24.3 (1.18x slower) | 28.6 / 26.3 (1.09x slower) | 28.8 / 26.0 (1.11x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA), `double` | 14.5 / 18.8 (1.30x faster) | 22.2 / 18.7 (1.18x slower) | 25.2 / 26.6 (1.06x faster) | 25.1 / 34.9 (1.39x faster) | 25.1 / 34.8 (1.39x faster) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA), `float` | 14.1 / 18.6 (1.31x faster) | 15.5 / 18.3 (1.19x faster) | 24.6 / 19.4 (1.27x slower) | 24.6 / 20.6 (1.19x slower) | 24.6 / 20.6 (1.19x slower) |
+
+The CUDA scalar path can beat the generic reduction for several `double`
+sizes because it keeps partials in device USM and copies back only the final
+scalar. The advantage is modest and is not uniform across types or sizes.
+
+#### Cumulative-sum latency on CUDA and Level Zero
+
+| Device / type | N=1 | N=64 | N=1,024 | N=2,048 | N=2,049 |
+|---|---:|---:|---:|---:|---:|
+| NVIDIA GB10 (CUDA), `double` | 24.1 / 10.9 (2.21x slower) | 40.8 / 10.6 (3.85x slower) | 49.1 / 19.8 (2.48x slower) | 60.2 / 29.3 (2.05x slower) | 92.7 / 25.2 (3.67x slower) |
+| NVIDIA GB10 (CUDA), `float` | 21.7 / 10.4 (2.10x slower) | 35.8 / 10.0 (3.56x slower) | 38.6 / 11.1 (3.49x slower) | 50.0 / 12.4 (4.04x slower) | 72.6 / 26.3 (2.77x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA), `double` | 21.3 / 9.2 (2.32x slower) | 36.1 / 8.8 (4.08x slower) | 44.5 / 17.2 (2.59x slower) | 54.9 / 26.4 (2.08x slower) | 82.3 / 21.8 (3.77x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA), `float` | 19.1 / 8.7 (2.20x slower) | 31.7 / 8.6 (3.68x slower) | 34.0 / 9.4 (3.61x slower) | 44.3 / 10.6 (4.20x slower) | 64.4 / 22.7 (2.84x slower) |
+| Intel Arc Pro B70 (Level-Zero), `double` | 94.0 / 42.8 (2.20x slower) | 109.8 / 42.9 (2.56x slower) | 118.3 / 46.1 (2.56x slower) | 119.5 / 47.6 (2.51x slower) | 190.5 / 55.9 (3.41x slower) |
+| Intel Arc Pro B70 (Level-Zero), `float` | 92.8 / 42.0 (2.21x slower) | 106.6 / 41.6 (2.56x slower) | 114.8 / 43.1 (2.66x slower) | 119.9 / 46.0 (2.61x slower) | 183.4 / 57.1 (3.21x slower) |
+| Intel Core Ultra 7 265 iGPU (Level-Zero), `double` | 242.8 / 91.3 (2.66x slower) | 300.2 / 93.8 (3.20x slower) | 331.0 / 108.8 (3.04x slower) | 351.4 / 122.3 (2.87x slower) | 509.3 / 222.3 (2.29x slower) |
+| Intel Core Ultra 7 265 iGPU (Level-Zero), `float` | 243.1 / 91.3 (2.66x slower) | 287.8 / 92.6 (3.11x slower) | 304.2 / 101.3 (3.00x slower) | 318.0 / 110.9 (2.87x slower) | 456.3 / 184.2 (2.48x slower) |
+
+With the default work-group size, one tile contains 2,048 elements. CUDA and
+Level Zero therefore use the fast path through `N=2048`; `N=2049` is the
+intentional first multi-tile control. The fast path materially reduces ADN's
+own fixed overhead, but the reproducibility guarantee still costs more than
+a conventional oneDPL scan at these sizes.
+
 ### Scalar-sum throughput
 
 | Device (backend) | `double` sum / baseline* (GElements/s) | `float` sum / baseline* (GElements/s) |
 |---|---:|---:|
-| NVIDIA GB10 (CUDA) | 26.3 / 31.7 (1.2x slower) | 55.5 / 62.9 (1.1x slower) |
-| NVIDIA RTX PRO 4500 Blackwell (CUDA) | 48.7 / 77.0 (1.6x slower) | 121.2 / 124.5 (1.0x slower) |
-| AMD Radeon Pro W7500 (HIP) | 9.2 / 14.8 (1.6x slower) | 15.7 / 20.0 (1.3x slower) |
-| Intel Arc Pro B70 (Level-Zero) | 25.3 / 58.3 (2.3x slower) | 56.6 / 99.6 (1.8x slower) |
-| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 1.7 / 6.6 (3.8x slower) | 4.2 / 12.8 (3.0x slower) |
-| Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.6 (13.4x slower) | 0.6 / 7.6 (12.5x slower) |
+| NVIDIA GB10 (CUDA) | 25.5 / 31.2 (1.2x slower) | 55.4 / 62.1 (1.1x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA) | 50.5 / 78.2 (1.5x slower) | 135.1 / 126.4 (1.1x faster) |
+| AMD Radeon Pro W7500 (HIP) | 9.3 / 14.5 (1.6x slower) | 16.0 / 19.1 (1.2x slower) |
+| Intel Arc Pro B70 (Level-Zero) | 26.7 / 57.3 (2.1x slower) | 54.2 / 98.5 (1.8x slower) |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 1.8 / 6.6 (3.6x slower) | 5.0 / 12.9 (2.6x slower) |
+| Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.6 (13.8x slower) | 0.6 / 7.7 (13.1x slower) |
 
 *Baseline = plain (non-reproducible) `sycl::reduction` of the same data
 type on the same device. It is a comparison point, not a hard performance
 ceiling. A binned deposit performs multiple dependent additions and
 subtractions per fold; the observed gap also includes compiler, backend,
-and runtime effects. The slowdown factor is `baseline / sum`.
+and runtime effects. Parenthetical factors compare the faster throughput to
+the slower throughput.
 
 > **Note:** The CPU backend uses the SYCL runtime's parallel thread pool
 > (OpenCL CPU runtime), so it can use the available CPU cores. The
@@ -162,12 +220,12 @@ provide the reproducibility guarantees of `adn::cumsum`.
 
 | Device (backend) | `double` cumsum / baseline* (GElements/s) | `float` cumsum / baseline* (GElements/s) |
 |---|---:|---:|
-| NVIDIA GB10 (CUDA) | 2.364 / 7.606 (3.2x slower) | 3.413 / 14.980 (4.4x slower) |
-| NVIDIA RTX PRO 4500 Blackwell (CUDA) | 4.855 / 21.383 (4.4x slower) | 6.696 / 40.480 (6.0x slower) |
-| AMD Radeon Pro W7500 (HIP) | 0.751 / 4.876 (6.5x slower) | 1.089 / 9.126 (8.4x slower) |
-| Intel Arc Pro B70 (Level-Zero) | 3.102 / 18.769 (6.1x slower) | 5.975 / 42.408 (7.1x slower) |
-| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 0.151 / 0.610 (4.0x slower) | 0.287 / 2.445 (8.5x slower) |
-| Intel Core Ultra 7 265 CPU (OpenCL) | 0.116 / 1.497 (13.0x slower) | 0.139 / 2.554 (18.4x slower) |
+| NVIDIA GB10 (CUDA) | 2.524 / 7.756 (3.1x slower) | 3.500 / 13.868 (4.0x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA) | 5.304 / 21.563 (4.1x slower) | 6.815 / 40.780 (6.0x slower) |
+| AMD Radeon Pro W7500 (HIP) | 0.818 / 4.910 (6.0x slower) | 1.181 / 9.127 (7.7x slower) |
+| Intel Arc Pro B70 (Level-Zero) | 3.926 / 19.280 (4.9x slower) | 7.181 / 43.274 (6.0x slower) |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 0.191 / 0.610 (3.2x slower) | 0.357 / 2.445 (6.9x slower) |
+| Intel Core Ultra 7 265 CPU (OpenCL) | 0.144 / 1.497 (10.4x slower) | 0.173 / 2.525 (14.6x slower) |
 
 *Baseline = oneDPL `inclusive_scan` of the same data type on the same device.
 The slowdown factor is `baseline / cumsum`.
@@ -480,7 +538,8 @@ make test AMD_GPU_ARCH=gfx1102
 make test-validation AMD_GPU_ARCH=gfx1102
 ```
 
-The test binary includes the oneDPL cumulative-sum benchmark. Until
+The test binary uses oneDPL as the cumulative-sum baseline in both latency
+and throughput benchmarks. Until
 [intel/llvm#22665](https://github.com/intel/llvm/pull/22665) is available in
 the compiler, its AMD libspirv device library must be patched with the missing
 group non-uniform shuffle builtins. The Makefile also supplies the libspirv
@@ -539,10 +598,11 @@ The Google Test suite chooses one preferred backend per distinct device name
 (Level-Zero, then CUDA, then other backends, with OpenCL as the fallback).
 Each correctness case runs once per selected CPU or GPU from a single fat
 binary (CUDA + SPIR-V + AMDGCN by default), plus cross-device bit-identity
-tests and throughput benchmarks. There are 185 correctness cases and 4
-benchmarks per device, plus 11 cross-device cases and one version test: 768
-tests on a system with three GPUs and one CPU. The `WG_SIZE=1024` cases skip on
-a device whose work-group or local memory limits cannot support that
+tests and performance benchmarks. There are 189 correctness cases and 8
+benchmarks per device, plus 11 cross-device cases and one version test: 800
+tests on a system with three GPUs and one CPU. Four benchmarks measure 100M
+element throughput and four measure small-N latency. The `WG_SIZE=1024` cases
+skip on a device whose work-group or local memory limits cannot support that
 configuration.
 
 | Category | Description |
@@ -557,7 +617,7 @@ configuration.
 | Environment safety | Host FP-mode independence, USM capability checks, shared validation, exception-safe USM cleanup, unsafe device mode rejection |
 | Conversion regressions | Independent prefix references, signed/scaled rounding boundaries, all float folds, shuffles, in-place scans, and cross-device identity |
 | Configurations | Float K = 2-21; selected double K up to 52; every power-of-two WG_SIZE from 2 to 1024 where supported; device- and host-pointer APIs |
-| Benchmarks | `adn::sum` and `adn::cumsum` throughput on all selected devices (GPU + CPU) |
+| Benchmarks | `adn::sum` and `adn::cumsum` small-N latency and 100M throughput on every selected GPU and CPU |
 
 ```bash
 # Run the normal suite, including benchmarks
@@ -575,9 +635,16 @@ LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test --gtest_filter="*Float*"
 # Run only CPU tests
 LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test --gtest_filter="CPUs/*"
 
-# Run only benchmarks, three invocations as in the performance tables
+# Reproduce the throughput tables with three invocations
 for run in 1 2 3; do
-   GTEST_FILTER='*Bench*' GTEST_OUTPUT="xml:build/benchmark-${run}.xml" make test
+   GTEST_FILTER='*Throughput*' \
+      GTEST_OUTPUT="xml:build/throughput-${run}.xml" make test
+done
+
+# Reproduce the small-N tables with five invocations
+for run in 1 2 3 4 5; do
+   GTEST_FILTER='*Latency_*_SmallN*' \
+      GTEST_OUTPUT="xml:build/latency-${run}.xml" make test
 done
 
 # Run only cumulative-sum benchmarks

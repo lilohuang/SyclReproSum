@@ -15,6 +15,7 @@
 #include <oneapi/dpl/execution>
 #include <oneapi/dpl/numeric>
 #include <sycl/sycl.hpp>
+#include <array>
 #include <atomic>
 #include <vector>
 #include <cfenv>
@@ -366,6 +367,28 @@ TEST_P(ADNSumTest, DeviceEnvironmentValidated) {
 
    EXPECT_NO_THROW(adn::validate_environment<float>(queue()));
    EXPECT_NO_THROW(adn::validate_environment<double>(queue()));
+}
+
+TEST_P(ADNSumTest, DefaultSumGroupCountSelectedForDevice) {
+   const sycl::device device = queue().get_device();
+   const sycl::backend backend = queue().get_backend();
+   const bool tuned_intel_gpu =
+      adn::detail::is_intel_gpu_sum_grid_device(backend, device);
+   bool cached_tuning = false;
+   EXPECT_EQ(
+      (adn::detail::validate_environment_for<double,
+         adn::detail::SumSpecialization<3, 256>>(queue(), &cached_tuning)),
+      backend);
+   EXPECT_EQ(cached_tuning, tuned_intel_gpu);
+
+   EXPECT_EQ((adn::detail::sum_group_count<3, 256>(2048, cached_tuning)),
+      size_t(2048));
+   EXPECT_EQ((adn::detail::sum_group_count<3, 256>(2049, cached_tuning)),
+      tuned_intel_gpu ? size_t(256) : size_t(2048));
+   EXPECT_EQ((adn::detail::sum_group_count<4, 256>(4096, cached_tuning)),
+      size_t(2048));
+   EXPECT_EQ((adn::detail::sum_group_count<3, 128>(4096, cached_tuning)),
+      size_t(2048));
 }
 
 TEST_P(ADNSumTest, HostRoundingModeIndependent) {
@@ -2068,6 +2091,28 @@ TEST_P(ADNSumTest, Float_PowersOfTwoSpan) {
 //  Stress: very large arrays
 // ============================================================
 
+TEST_P(ADNSumTest, TunedDefaultGridOrderIndependent) {
+   constexpr size_t size = size_t(2048) * 256 + 1;
+   std::vector<double> base(size);
+   for (size_t i = 0; i < base.size(); ++i) {
+      base[i] = static_cast<double>(static_cast<int>(i % 97) - 48);
+   }
+   base[0] = 1e15;
+   base[1] = -1e15;
+
+   const double reference = adn::sum(queue(), base.data(), base.size());
+   EXPECT_BIT_EQ(
+      (adn::sum<3, 128>(queue(), base.data(), base.size())), reference);
+   for (unsigned seed = 1; seed <= 3; ++seed) {
+      std::vector<double> shuffled = base;
+      std::mt19937 rng(seed);
+      std::shuffle(shuffled.begin(), shuffled.end(), rng);
+      EXPECT_BIT_EQ(
+         adn::sum(queue(), shuffled.data(), shuffled.size()), reference)
+         << "Seed " << seed << " produced different result";
+   }
+}
+
 TEST_P(ADNSumTest, TwentyMillion_Reproducible) {
    const int N = 20000000;
    std::vector<double> v(N, 1.0);
@@ -2308,6 +2353,59 @@ static void expect_cumsum_matches_sum(sycl::queue &q,
       ASSERT_LT(i, input.size());
       EXPECT_BIT_EQ(output[i], adn::sum<K>(q, input.data(), i + 1))
          << "prefix " << i;
+   }
+}
+
+template <size_t ITEMS_PER_WORK_ITEM, typename T>
+static std::vector<T> run_cumsum_tile_shape(
+   sycl::queue &q, const std::vector<T> &input) {
+   auto device_input = adn::detail::allocate_device_usm<T>(input.size(), q);
+   auto device_output = adn::detail::allocate_device_usm<T>(input.size(), q);
+   q.memcpy(device_input.get(), input.data(), input.size() * sizeof(T))
+      .wait_and_throw();
+   adn::detail::cumsum_tiled_impl<ITEMS_PER_WORK_ITEM, T, 3, 256>(q,
+      device_input.get(), device_output.get(), input.size(), {},
+      q.get_backend());
+
+   std::vector<T> output(input.size());
+   q.memcpy(output.data(), device_output.get(), output.size() * sizeof(T))
+      .wait_and_throw();
+   return output;
+}
+
+template <typename T>
+static void expect_large_cumsum_tile_after_shuffle(sycl::queue &q) {
+   constexpr size_t N = size_t(64) * 256 * 256 + 37;
+   std::mt19937 gen(9271);
+   std::uniform_real_distribution<T> dist(T(-1e6), T(1e6));
+   std::vector<T> input(N);
+   for (T &x : input) {
+      x = dist(gen);
+   }
+   const T large = std::is_same_v<T, double> ? T(1e16) : T(1e8);
+   for (size_t i = 0; i + 2 < N; i += 8191) {
+      input[i] = large;
+      input[i + 1] = -large;
+      input[i + 2] = T(1);
+   }
+
+   T reference_total = T(0);
+   for (unsigned seed = 0; seed < 2; ++seed) {
+      SCOPED_TRACE("bytes=" + std::to_string(sizeof(T)) +
+         ", seed=" + std::to_string(seed));
+      if (seed != 0) {
+         std::shuffle(input.begin(), input.end(), gen);
+      }
+
+      const std::vector<T> tile8 = run_cumsum_tile_shape<8>(q, input);
+      const std::vector<T> tile16 = run_cumsum_tile_shape<16>(q, input);
+      expect_bit_identical_arrays(tile16, tile8, "generic large tile");
+
+      if (seed == 0) {
+         reference_total = tile8.back();
+      } else {
+         EXPECT_BIT_EQ(tile8.back(), reference_total);
+      }
    }
 }
 
@@ -2766,6 +2864,47 @@ TEST_P(ADNSumTest, Cumsum_SizeBoundaryMatrix) {
          EXPECT_EQ(output[i], static_cast<float>(i + 1)) << "N=" << N;
       }
    }
+}
+
+TEST_P(ADNSumTest, Cumsum_SingleTilePathMatchesMultiTilePathAfterShuffle) {
+   constexpr size_t N = 1021;
+   std::mt19937 gen(611);
+   std::uniform_real_distribution<double> dist(-1e100, 1e100);
+   std::vector<double> input(N);
+   for (double &x : input) {
+      x = dist(gen);
+   }
+   for (size_t i = 0; i + 2 < N; i += 97) {
+      input[i] = 1e200;
+      input[i + 1] = -1e200;
+      input[i + 2] = 1.0;
+   }
+
+   double reference_total = 0.0;
+   for (unsigned seed = 1; seed <= 4; ++seed) {
+      std::shuffle(input.begin(), input.end(), gen);
+      std::vector<double> single_tile(N);
+      std::vector<double> multi_tile(N);
+      adn::cumsum<3, 256>(
+         queue(), input.data(), single_tile.data(), input.size());
+      adn::cumsum<3, 64>(
+         queue(), input.data(), multi_tile.data(), input.size());
+
+      ASSERT_EQ(
+         std::memcmp(single_tile.data(), multi_tile.data(), N * sizeof(double)),
+         0)
+         << "seed " << seed;
+      if (seed == 1) {
+         reference_total = single_tile.back();
+      } else {
+         EXPECT_BIT_EQ(single_tile.back(), reference_total) << "seed " << seed;
+      }
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_GenericLargeTileBitIdenticalAfterShuffle) {
+   expect_large_cumsum_tile_after_shuffle<double>(queue());
+   expect_large_cumsum_tile_after_shuffle<float>(queue());
 }
 
 TEST_P(ADNSumTest, Cumsum_WorkGroupSizeIndependent) {
@@ -3291,15 +3430,78 @@ TEST_P(ADNSumTest, Cumsum_ShuffledBlocksKeepBoundaryBits) {
 }
 
 // ============================================================
-//  Throughput benchmarks (informational)
+//  Performance benchmarks (informational)
 //
 //  Measures adn::sum against a plain (non-reproducible)
 //  sycl::reduction sum, which serves as the device memory
-//  throughput ceiling for a single-pass reduction.  Results are
-//  reported via GTest RecordProperty and stdout; the only hard
-//  assertion is that both sums complete and the reproducible
-//  throughput is a sane fraction of the naive one.
+//  throughput ceiling for a single-pass reduction. Small-N latency
+//  measurements alternate the baseline and reproducible operations
+//  to reduce drift. Results are reported via GTest RecordProperty and
+//  stdout; the only hard assertion is that both operations complete
+//  with finite results.
 // ============================================================
+
+constexpr std::array<size_t, 5> SMALL_N_SIZES = {1, 64, 1024, 2048, 2049};
+constexpr int SMALL_N_LATENCY_ROUNDS = 201;
+
+struct LatencyResult {
+   double baseline_us;
+   double binned_us;
+};
+
+template <typename F> static double time_one_call_us(F &&f) {
+   const auto begin = std::chrono::steady_clock::now();
+   f();
+   const auto end = std::chrono::steady_clock::now();
+   return std::chrono::duration<double, std::micro>(end - begin).count();
+}
+
+static double median_us(std::vector<double> samples) {
+   std::sort(samples.begin(), samples.end());
+   return samples[samples.size() / 2];
+}
+
+template <typename Baseline, typename Binned>
+static LatencyResult compare_latency_us(Baseline &&baseline, Binned &&binned) {
+   for (int i = 0; i < 3; ++i) {
+      baseline();
+      binned();
+   }
+
+   std::vector<double> baseline_samples;
+   std::vector<double> binned_samples;
+   baseline_samples.reserve(SMALL_N_LATENCY_ROUNDS);
+   binned_samples.reserve(SMALL_N_LATENCY_ROUNDS);
+   for (int i = 0; i < SMALL_N_LATENCY_ROUNDS; ++i) {
+      if ((i & 1) == 0) {
+         baseline_samples.push_back(time_one_call_us(baseline));
+         binned_samples.push_back(time_one_call_us(binned));
+      } else {
+         binned_samples.push_back(time_one_call_us(binned));
+         baseline_samples.push_back(time_one_call_us(baseline));
+      }
+   }
+   return {median_us(baseline_samples), median_us(binned_samples)};
+}
+
+static void record_latency(const LatencyResult &result, size_t N) {
+   const std::string suffix = "_us_N" + std::to_string(N);
+   ::testing::Test::RecordProperty("baseline" + suffix, result.baseline_us);
+   ::testing::Test::RecordProperty("binned" + suffix, result.binned_us);
+}
+
+static void print_latency_comparison(const char *device_name,
+   const char *type_name, const char *baseline_name, const char *binned_name,
+   size_t N, const LatencyResult &result) {
+   const bool binned_is_faster = result.binned_us <= result.baseline_us;
+   const double factor = binned_is_faster
+      ? result.baseline_us / result.binned_us
+      : result.binned_us / result.baseline_us;
+   std::printf("  [latency] %s: %-6s N=%zu  %s %7.1f us | %s %7.1f us "
+               "(%.2fx %s)\n",
+      device_name, type_name, N, baseline_name, result.baseline_us, binned_name,
+      result.binned_us, factor, binned_is_faster ? "faster" : "slower");
+}
 
 class ADNSumBench : public ADNSumTest {
 protected:
@@ -3364,7 +3566,60 @@ protected:
          GetParam().get_info<sycl::info::device::name>().c_str(), type_name, N,
          r.naive_gelem_s, r.binned_gelem_s, slowdown);
    }
+
+   template <typename T> LatencyResult run_latency(size_t N) {
+      std::mt19937 gen(7);
+      std::uniform_real_distribution<T> dist(T(-1e6), T(1e6));
+      std::vector<T> input(N);
+      for (T &x : input) {
+         x = dist(gen);
+      }
+
+      auto device_input = adn::detail::allocate_device_usm<T>(N, queue());
+      auto baseline_output = adn::detail::allocate_shared_usm<T>(1, queue());
+      queue()
+         .memcpy(device_input.get(), input.data(), N * sizeof(T))
+         .wait_and_throw();
+      T *const input_ptr = device_input.get();
+
+      volatile T binned_output = T(0);
+      auto baseline = [&] {
+         *baseline_output = T(0);
+         queue()
+            .submit([&](sycl::handler &h) {
+            h.parallel_for(sycl::range<1>(N),
+               sycl::reduction(baseline_output.get(), sycl::plus<T>()),
+               [=](sycl::id<1> i, auto &sum) { sum.combine(input_ptr[i]); });
+         }).wait_and_throw();
+      };
+      auto binned = [&] {
+         binned_output = adn::sum(queue(), device_input.get(), N);
+      };
+      const LatencyResult result = compare_latency_us(baseline, binned);
+      EXPECT_TRUE(std::isfinite(*baseline_output));
+      EXPECT_TRUE(std::isfinite(static_cast<T>(binned_output)));
+      return result;
+   }
+
+   template <typename T> void report_latency(const char *type_name) {
+      const std::string device_name =
+         GetParam().get_info<sycl::info::device::name>();
+      for (const size_t N : SMALL_N_SIZES) {
+         const LatencyResult result = run_latency<T>(N);
+         record_latency(result, N);
+         print_latency_comparison(device_name.c_str(), type_name,
+            "sycl::reduction", "adn::sum", N, result);
+      }
+   }
 };
+
+TEST_P(ADNSumBench, Latency_Double_SmallN) {
+   report_latency<double>("double");
+}
+
+TEST_P(ADNSumBench, Latency_Float_SmallN) {
+   report_latency<float>("float");
+}
 
 TEST_P(ADNSumBench, Throughput_Double_100M) {
    report<double>("double", 100000000);
@@ -3381,6 +3636,7 @@ INSTANTIATE_TEST_SUITE_P(
    CPUs, ADNSumBench, ::testing::ValuesIn(all_cpus()), device_label);
 
 template <typename T> class ADNCumsumBaselinePolicy;
+template <typename T> class ADNCumsumLatencyBaselinePolicy;
 
 class ADNCumsumBench : public ADNSumTest {
 protected:
@@ -3453,7 +3709,66 @@ protected:
          GetParam().get_info<sycl::info::device::name>().c_str(), type_name, N,
          result.baseline_gelem_s, result.binned_gelem_s, slowdown);
    }
+
+   template <typename T> LatencyResult run_latency(size_t N) {
+      std::mt19937 gen(7);
+      std::uniform_real_distribution<T> dist(T(-1e6), T(1e6));
+      std::vector<T> input(N);
+      for (T &x : input) {
+         x = dist(gen);
+      }
+
+      auto device_input = adn::detail::allocate_device_usm<T>(N, queue());
+      auto baseline_output = adn::detail::allocate_device_usm<T>(N, queue());
+      auto binned_output = adn::detail::allocate_device_usm<T>(N, queue());
+      queue()
+         .memcpy(device_input.get(), input.data(), N * sizeof(T))
+         .wait_and_throw();
+      auto policy = oneapi::dpl::execution::make_device_policy<
+         ADNCumsumLatencyBaselinePolicy<T>>(queue());
+
+      auto baseline = [&] {
+         oneapi::dpl::inclusive_scan(policy, device_input.get(),
+            device_input.get() + N, baseline_output.get(), std::plus<T>{});
+         queue().wait_and_throw();
+      };
+      auto binned = [&] {
+         adn::cumsum(queue(), device_input.get(), binned_output.get(), N);
+      };
+      const LatencyResult result = compare_latency_us(baseline, binned);
+
+      T baseline_last;
+      T binned_last;
+      queue()
+         .memcpy(&baseline_last, baseline_output.get() + N - 1, sizeof(T))
+         .wait_and_throw();
+      queue()
+         .memcpy(&binned_last, binned_output.get() + N - 1, sizeof(T))
+         .wait_and_throw();
+      EXPECT_TRUE(std::isfinite(baseline_last));
+      EXPECT_TRUE(std::isfinite(binned_last));
+      return result;
+   }
+
+   template <typename T> void report_latency(const char *type_name) {
+      const std::string device_name =
+         GetParam().get_info<sycl::info::device::name>();
+      for (const size_t N : SMALL_N_SIZES) {
+         const LatencyResult result = run_latency<T>(N);
+         record_latency(result, N);
+         print_latency_comparison(device_name.c_str(), type_name, "oneDPL scan",
+            "adn::cumsum", N, result);
+      }
+   }
 };
+
+TEST_P(ADNCumsumBench, Latency_Double_SmallN) {
+   report_latency<double>("double");
+}
+
+TEST_P(ADNCumsumBench, Latency_Float_SmallN) {
+   report_latency<float>("float");
+}
 
 TEST_P(ADNCumsumBench, Throughput_Double_100M) {
    report<double>("double", 100000000);
@@ -3477,7 +3792,7 @@ TEST(Version, MacroEncoding) {
    EXPECT_EQ(SYCL_REPRO_SUM_VERSION,
       SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +
          SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH);
-   EXPECT_GE(SYCL_REPRO_SUM_VERSION, 10200); // at least 1.2.0
+   EXPECT_GE(SYCL_REPRO_SUM_VERSION, 10300); // at least 1.3.0
    EXPECT_EQ(adn::max_reproducible_count<float>, UINT64_C(4294966784));
    EXPECT_EQ(
       adn::max_reproducible_count<double>, UINT64_C(9223372036854773760));
