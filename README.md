@@ -546,6 +546,11 @@ group non-uniform shuffle builtins. The Makefile also supplies the libspirv
 compatibility layout and the verified GlobalOffset LTO pipeline workaround
 automatically.
 
+The Makefile searches the compiler resource directory for AMD libspirv in
+`lib/amdgcn-amd-amdhsa`, `lib/amdgpu-amd-amdhsa`, and the legacy
+`lib/amdgcn-amd-amdhsa-llvm` directory, in that order. Set `AMD_LIBSPIRV`
+explicitly to use a different bitcode file.
+
 The compatibility layout is created inside a configuration-specific
 `build/clang-resource-*` directory. The Makefile re-emits the signed-character
 libspirv bitcode with the `amdgcn-amd-amdhsa` target triple, avoiding a target

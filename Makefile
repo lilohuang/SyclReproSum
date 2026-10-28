@@ -85,8 +85,13 @@ AMD_DETECTED_ARCH    = $(firstword $(filter-out gfx000, \
 AMD_GPU_ARCH         ?= $(AMD_DETECTED_ARCH)
 REAL_RESOURCE_DIR    = $(shell $(CXX) -print-resource-dir 2>/dev/null)
 AMD_LIBSPIRV_NAME    = libspirv.l64.signed_char.bc
-AMD_LIBSPIRV_DIR     = $(REAL_RESOURCE_DIR)/lib/$(AMD_TARGET)-llvm
-AMD_LIBSPIRV         ?= $(AMD_LIBSPIRV_DIR)/$(AMD_LIBSPIRV_NAME)
+AMD_LIBSPIRV_DIRS    = $(REAL_RESOURCE_DIR)/lib/$(AMD_TARGET) \
+	$(REAL_RESOURCE_DIR)/lib/amdgpu-amd-amdhsa \
+	$(REAL_RESOURCE_DIR)/lib/$(AMD_TARGET)-llvm
+AMD_LIBSPIRV_CANDIDATES = $(addsuffix /$(AMD_LIBSPIRV_NAME), \
+	$(AMD_LIBSPIRV_DIRS))
+AMD_LIBSPIRV         ?= $(firstword \
+	$(wildcard $(AMD_LIBSPIRV_CANDIDATES)) $(AMD_LIBSPIRV_CANDIDATES))
 AMD_LIBSPIRV_SOURCE_DIR = $(patsubst %/,%,$(abspath \
 	$(dir $(AMD_LIBSPIRV))))
 CXX_ID               = $(shell $(CXX) --version 2>/dev/null | sha256sum | \
