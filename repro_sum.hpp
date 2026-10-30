@@ -72,11 +72,11 @@
 /// SYCL_REPRO_SUM_VERSION encodes MAJOR * 10000 + MINOR * 100 + PATCH,
 /// so version checks can be done with a single comparison:
 /// @code
-///   #if SYCL_REPRO_SUM_VERSION >= 10300  // require >= 1.3.0
+///   #if SYCL_REPRO_SUM_VERSION >= 10400  // require >= 1.4.0
 /// @endcode
 /// @{
 #define SYCL_REPRO_SUM_VERSION_MAJOR 1
-#define SYCL_REPRO_SUM_VERSION_MINOR 3
+#define SYCL_REPRO_SUM_VERSION_MINOR 4
 #define SYCL_REPRO_SUM_VERSION_PATCH 0
 #define SYCL_REPRO_SUM_VERSION                                                 \
    (SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +                                     \
@@ -106,6 +106,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #if defined(__SYCL_DEVICE_ONLY__)
@@ -789,6 +790,93 @@ inline size_t sum_group_count(
 }
 
 /**
+ * @brief Reusable scratch per host thread and accumulator type.
+ *
+ * Retain only the most recently used context/device, growing to the largest
+ * reduction grid seen there. Each sum overwrites every partial it will read.
+ * Single-tile scans use a separate, immutable zero-prefix allocation.
+ */
+template <typename T, int K> struct SumPartialsCache {
+   std::optional<UsmUniquePtr<Binned<T, K>>> storage;
+   std::optional<sycl::device> device;
+   size_t capacity = 0;
+   bool in_use = false;
+};
+
+template <typename T, int K, bool ZERO_PREFIX = false>
+inline SumPartialsCache<T, K> *sum_partials_cache() {
+   // This trivial flag outlives the owner. Later thread-local or static
+   // destructors must not pass through the destroyed owner's declaration.
+   static thread_local bool destroyed = false;
+   if (destroyed) {
+      return nullptr;
+   }
+   struct Owner {
+      SumPartialsCache<T, K> cache;
+      ~Owner() { destroyed = true; }
+   };
+   static thread_local Owner owner;
+   return &owner.cache;
+}
+
+/**
+ * @brief Exclusively borrow reduction scratch or a zero-prefix buffer.
+ *
+ * Reentrant calls and calls after cache teardown use a separate allocation.
+ * The caller must finish all work using the buffer before this lease ends,
+ * including when a submission fails.
+ * ZERO_PREFIX storage is initialized only on allocation and must stay zero.
+ */
+template <typename T, int K, bool ZERO_PREFIX = false> class SumPartialsLease {
+   using Acc = Binned<T, K>;
+   SumPartialsCache<T, K> *cache_ = nullptr;
+   std::optional<UsmUniquePtr<Acc>> temporary_;
+   Acc *data_ = nullptr;
+
+public:
+   SumPartialsLease(size_t count, sycl::queue &q, bool device_partials) {
+      auto allocate = [&] {
+         auto storage = device_partials ? allocate_device_usm<Acc>(count, q)
+                                        : allocate_shared_usm<Acc>(count, q);
+         if constexpr (ZERO_PREFIX) {
+            q.memset(storage.get(), 0, count * sizeof(Acc)).wait_and_throw();
+         }
+         return storage;
+      };
+      auto *cache = sum_partials_cache<T, K, ZERO_PREFIX>();
+      if (cache == nullptr || cache->in_use) {
+         temporary_.emplace(allocate());
+         data_ = temporary_->get();
+         return;
+      }
+
+      const sycl::device device = q.get_device();
+      if (!cache->storage || cache->capacity < count ||
+         cache->storage->get_deleter().context != q.get_context() ||
+         *cache->device != device) {
+         auto storage = allocate();
+         cache->storage.emplace(std::move(storage));
+         cache->device = device;
+         cache->capacity = count;
+      }
+      cache->in_use = true;
+      cache_ = cache;
+      data_ = cache->storage->get();
+   }
+
+   SumPartialsLease(const SumPartialsLease &) = delete;
+   SumPartialsLease &operator=(const SumPartialsLease &) = delete;
+
+   ~SumPartialsLease() {
+      if (cache_ != nullptr) {
+         cache_->in_use = false;
+      }
+   }
+
+   Acc *get() const { return data_; }
+};
+
+/**
  * @brief Single-pass input kernel plus device-side final reduction.
  *
  * A fixed grid of work-items strides over the input.  Each work-item
@@ -818,10 +906,8 @@ T sum_impl(sycl::queue &q, const T *d_arr, size_t N,
       sum_group_count<K, WG_SIZE>(groups_needed, use_reduced_intel_gpu_grid);
 
    const bool use_device_partials = backend == sycl::backend::ext_oneapi_cuda;
-   auto partial_owner = use_device_partials
-      ? allocate_device_usm<Acc>(num_groups, q)
-      : allocate_shared_usm<Acc>(num_groups, q);
-   Acc *d_partial = partial_owner.get();
+   SumPartialsLease<T, K> partials(num_groups, q, use_device_partials);
+   Acc *d_partial = partials.get();
 
    sycl::event partials_ready = q.submit([&](sycl::handler &h) {
       if (!dependencies.empty()) {
@@ -1010,91 +1096,20 @@ void binned_exclusive_scan(
 }
 
 /**
- * @brief Device implementation of reproducible cumulative sums.
- *
- * A tile contains a short contiguous segment per work-item.  The first pass
- * computes one binned total per tile.  Those totals are scanned without
- * converting them to scalar floating point.  The final pass replays each
- * tile from its incoming binned prefix and converts every element prefix.
- * This keeps temporary storage proportional to the number of tiles instead
- * of storing a full binned accumulator for every output element.
+ * @brief Replay tiles and convert prefixes with one shared kernel shape.
  */
 template <size_t ITEMS_PER_WORK_ITEM, typename T, int K, int WG_SIZE>
-void cumsum_tiled_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N,
-   const std::vector<sycl::event> &dependencies, sycl::backend backend) {
+void cumsum_write_prefixes(sycl::queue &q, const T *d_input, T *d_output,
+   size_t N, size_t num_tiles, const Binned<T, K> *tile_prefixes,
+   const std::vector<sycl::event> &dependencies) {
    SYCL_REPRO_SUM_DETAIL_STRICT_FP
    using Acc = Binned<T, K>;
-
-   static_assert(ITEMS_PER_WORK_ITEM > 0,
-      "cumsum tile must contain at least one item per work-item");
    constexpr size_t TILE_SIZE = size_t(WG_SIZE) * ITEMS_PER_WORK_ITEM;
-   const size_t num_tiles = (N + TILE_SIZE - 1) / TILE_SIZE;
-   const bool use_single_tile_fast_path = num_tiles == 1 &&
-      (backend == sycl::backend::ext_oneapi_cuda ||
-         backend == sycl::backend::ext_oneapi_level_zero);
-
-   std::optional<UsmUniquePtr<Acc>> totals_owner;
-   std::optional<UsmUniquePtr<Acc>> prefixes_owner;
-   Acc *tile_prefixes = nullptr;
-
-   if (!use_single_tile_fast_path) {
-      totals_owner.emplace(allocate_device_usm<Acc>(num_tiles, q));
-      prefixes_owner.emplace(allocate_device_usm<Acc>(num_tiles, q));
-      Acc *tile_totals = totals_owner->get();
-      tile_prefixes = prefixes_owner->get();
-
-      q.submit([&](sycl::handler &h) {
-         if (!dependencies.empty()) {
-            h.depends_on(dependencies);
-         }
-         sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
-
-         auto compute_tile_totals = [=](sycl::nd_item<1> item) {
-            const size_t tile = item.get_group(0);
-            const size_t lid = item.get_local_id(0);
-            const size_t begin = tile * TILE_SIZE + lid * ITEMS_PER_WORK_ITEM;
-
-            Acc acc{};
-            int e_threshold = -1;
-            int since_renorm = 0;
-            for (size_t j = 0; j < ITEMS_PER_WORK_ITEM; ++j) {
-               const size_t i = begin + j;
-               if (i < N) {
-                  accumulate(acc, e_threshold, since_renorm, d_input[i]);
-               }
-            }
-            renorm(acc);
-
-            loc[lid] = acc;
-            sycl::group_barrier(item.get_group());
-
-            for (size_t offset = WG_SIZE / 2; offset > 0; offset >>= 1) {
-               if (lid < offset) {
-                  Acc lhs = loc[lid];
-                  merge(lhs, loc[lid + offset]);
-                  loc[lid] = lhs;
-               }
-               sycl::group_barrier(item.get_group());
-            }
-
-            if (lid == 0) {
-               tile_totals[tile] = loc[0];
-            }
-         };
-
-         h.parallel_for(sycl::nd_range<1>(num_tiles * WG_SIZE, WG_SIZE),
-            compute_tile_totals);
-      }).wait_and_throw();
-
-      binned_exclusive_scan<T, K, WG_SIZE>(
-         q, tile_totals, tile_prefixes, num_tiles);
-   } else {
-      prefixes_owner.emplace(allocate_device_usm<Acc>(1, q));
-      tile_prefixes = prefixes_owner->get();
-      q.memset(tile_prefixes, 0, sizeof(Acc), dependencies).wait_and_throw();
-   }
 
    q.submit([&](sycl::handler &h) {
+      if (!dependencies.empty()) {
+         h.depends_on(dependencies);
+      }
       sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
 
       auto write_prefixes = [=](sycl::nd_item<1> item) {
@@ -1167,6 +1182,92 @@ void cumsum_tiled_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N,
       h.parallel_for(
          sycl::nd_range<1>(num_tiles * WG_SIZE, WG_SIZE), write_prefixes);
    }).wait_and_throw();
+}
+
+/**
+ * @brief Device implementation of reproducible cumulative sums.
+ *
+ * A tile contains a short contiguous segment per work-item.  The first pass
+ * computes one binned total per tile.  Those totals are scanned without
+ * converting them to scalar floating point.  The final pass replays each
+ * tile from its incoming binned prefix and converts every element prefix.
+ * This keeps temporary storage proportional to the number of tiles instead
+ * of storing a full binned accumulator for every output element.
+ */
+template <size_t ITEMS_PER_WORK_ITEM, typename T, int K, int WG_SIZE>
+void cumsum_tiled_impl(sycl::queue &q, const T *d_input, T *d_output, size_t N,
+   const std::vector<sycl::event> &dependencies, sycl::backend backend) {
+   SYCL_REPRO_SUM_DETAIL_STRICT_FP
+   using Acc = Binned<T, K>;
+
+   static_assert(ITEMS_PER_WORK_ITEM > 0,
+      "cumsum tile must contain at least one item per work-item");
+   constexpr size_t TILE_SIZE = size_t(WG_SIZE) * ITEMS_PER_WORK_ITEM;
+   const size_t num_tiles = (N + TILE_SIZE - 1) / TILE_SIZE;
+   const bool use_single_tile_fast_path = num_tiles == 1 &&
+      (backend == sycl::backend::ext_oneapi_cuda ||
+         backend == sycl::backend::ext_oneapi_level_zero);
+
+   if (use_single_tile_fast_path) {
+      SumPartialsLease<T, K, true> zero_prefix(1, q, true);
+      cumsum_write_prefixes<ITEMS_PER_WORK_ITEM, T, K, WG_SIZE>(
+         q, d_input, d_output, N, num_tiles, zero_prefix.get(), dependencies);
+      return;
+   }
+
+   auto totals_owner = allocate_device_usm<Acc>(num_tiles, q);
+   auto prefixes_owner = allocate_device_usm<Acc>(num_tiles, q);
+   Acc *tile_totals = totals_owner.get();
+   Acc *tile_prefixes = prefixes_owner.get();
+
+   q.submit([&](sycl::handler &h) {
+      if (!dependencies.empty()) {
+         h.depends_on(dependencies);
+      }
+      sycl::local_accessor<Acc, 1> loc(sycl::range<1>(WG_SIZE), h);
+
+      auto compute_tile_totals = [=](sycl::nd_item<1> item) {
+         const size_t tile = item.get_group(0);
+         const size_t lid = item.get_local_id(0);
+         const size_t begin = tile * TILE_SIZE + lid * ITEMS_PER_WORK_ITEM;
+
+         Acc acc{};
+         int e_threshold = -1;
+         int since_renorm = 0;
+         for (size_t j = 0; j < ITEMS_PER_WORK_ITEM; ++j) {
+            const size_t i = begin + j;
+            if (i < N) {
+               accumulate(acc, e_threshold, since_renorm, d_input[i]);
+            }
+         }
+         renorm(acc);
+
+         loc[lid] = acc;
+         sycl::group_barrier(item.get_group());
+
+         for (size_t offset = WG_SIZE / 2; offset > 0; offset >>= 1) {
+            if (lid < offset) {
+               Acc lhs = loc[lid];
+               merge(lhs, loc[lid + offset]);
+               loc[lid] = lhs;
+            }
+            sycl::group_barrier(item.get_group());
+         }
+
+         if (lid == 0) {
+            tile_totals[tile] = loc[0];
+         }
+      };
+
+      h.parallel_for(
+         sycl::nd_range<1>(num_tiles * WG_SIZE, WG_SIZE), compute_tile_totals);
+   }).wait_and_throw();
+
+   binned_exclusive_scan<T, K, WG_SIZE>(
+      q, tile_totals, tile_prefixes, num_tiles);
+
+   cumsum_write_prefixes<ITEMS_PER_WORK_ITEM, T, K, WG_SIZE>(
+      q, d_input, d_output, N, num_tiles, tile_prefixes, {});
 }
 
 template <typename T, int K, int WG_SIZE>

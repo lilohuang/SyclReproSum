@@ -22,6 +22,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <cctype>
@@ -35,6 +36,7 @@
 #include <thread>
 #include <functional>
 #include <future>
+#include <exception>
 
 #if defined(__SSE__)
 #include <xmmintrin.h>
@@ -1339,6 +1341,149 @@ TEST_P(ADNSumTest, Sum_USMDependencies) {
    ASSERT_EQ(
       result.wait_for(std::chrono::seconds(5)), std::future_status::ready);
    EXPECT_EQ(result.get(), static_cast<double>(N));
+}
+
+// ============================================================
+//  Reduction scratch reuse
+// ============================================================
+
+template <typename T>
+static std::pair<std::vector<T>, T> exact_quarter_input(size_t N) {
+   std::vector<T> input(N);
+   std::int64_t units = 0;
+   for (size_t i = 0; i < N; ++i) {
+      const int value = static_cast<int>(i % 17) - 8;
+      input[i] = T(value) * T(0.25);
+      units += value;
+   }
+   if (N >= 2) {
+      units += 15;
+      input[0] = T(65536);
+      input[1] = T(-65536);
+   }
+   return {std::move(input), T(units) * T(0.25)};
+}
+
+template <typename T> static void check_sum_scratch_sizes(sycl::queue &q) {
+   std::mt19937 rng(8061);
+   // Alternate a scalar-only partial with fully written accumulators, grow
+   // the persistent grid, then shrink it again. No old partial may contribute.
+   for (size_t N : {1, 257, 8193, 524289, 2, 65, 257, 1}) {
+      auto data = exact_quarter_input<T>(N);
+      for (int run = 0; run < 3; ++run) {
+         SCOPED_TRACE(
+            "N=" + std::to_string(N) + ", bytes=" + std::to_string(sizeof(T)));
+         std::shuffle(data.first.begin(), data.first.end(), rng);
+         EXPECT_BIT_EQ(adn::sum(q, data.first.data(), N), data.second);
+         EXPECT_BIT_EQ((adn::sum<3, 64>(q, data.first.data(), N)), data.second);
+      }
+   }
+}
+
+TEST_P(ADNSumTest, Sum_ScratchReuseMatchesExactSumAfterShuffle) {
+   check_sum_scratch_sizes<float>(queue());
+   check_sum_scratch_sizes<double>(queue());
+}
+
+TEST_P(ADNSumTest, Sum_ScratchContextAndQueueSwitch) {
+   const sycl::device device = queue().get_device();
+   sycl::context first_context(device);
+   sycl::context second_context(device);
+   sycl::queue first(first_context, device);
+   sycl::queue same_context(first_context, device);
+   sycl::queue second(second_context, device);
+   std::mt19937 rng(8062);
+   for (sycl::queue *q : {&first, &same_context, &second, &first}) {
+      auto data = exact_quarter_input<double>(1025);
+      std::shuffle(data.first.begin(), data.first.end(), rng);
+      EXPECT_BIT_EQ(
+         adn::sum(*q, data.first.data(), data.first.size()), data.second);
+   }
+}
+
+template <typename T>
+static void check_sum_scratch_concurrency(sycl::queue &q) {
+   const sycl::context context = q.get_context();
+   const sycl::device device = q.get_device();
+   T warmup = T(1);
+   EXPECT_BIT_EQ(adn::sum(q, &warmup, 1), warmup);
+   constexpr size_t workers = 4;
+   std::array<std::exception_ptr, workers> failures{};
+   std::vector<std::thread> threads;
+   std::atomic<bool> start{false};
+   for (size_t worker = 0; worker < workers; ++worker) {
+      threads.emplace_back([&, worker] {
+         try {
+            sycl::queue worker_queue(context, device);
+            std::mt19937 rng(static_cast<unsigned>(8063 + worker));
+            while (!start.load(std::memory_order_acquire)) {
+               std::this_thread::yield();
+            }
+            for (size_t N : {1, 257, 65537, 1}) {
+               auto data = exact_quarter_input<T>(N);
+               data.first.back() += T(worker);
+               data.second += T(worker);
+               std::shuffle(data.first.begin(), data.first.end(), rng);
+               const T actual = adn::sum(worker_queue, data.first.data(), N);
+               if (bits_of(actual) != bits_of(data.second)) {
+                  throw std::runtime_error("concurrent scratch sum mismatch");
+               }
+               const size_t scan_size = std::min(N, size_t(2048));
+               std::vector<T> prefixes(scan_size);
+               adn::cumsum(
+                  worker_queue, data.first.data(), prefixes.data(), scan_size);
+               std::int64_t units = 0;
+               for (size_t i = 0; i < scan_size; ++i) {
+                  units += static_cast<std::int64_t>(data.first[i] * T(4));
+                  if (bits_of(prefixes[i]) != bits_of(T(units) * T(0.25))) {
+                     throw std::runtime_error(
+                        "concurrent scratch prefix mismatch");
+                  }
+               }
+            }
+         } catch (...) {
+            failures[worker] = std::current_exception();
+         }
+      });
+   }
+   start.store(true, std::memory_order_release);
+   for (std::thread &thread : threads) {
+      thread.join();
+   }
+   for (const auto &failure : failures) {
+      if (failure) {
+         std::rethrow_exception(failure);
+      }
+   }
+}
+
+TEST_P(ADNSumTest, Sum_ScratchConcurrentCalls) {
+   check_sum_scratch_concurrency<float>(queue());
+   check_sum_scratch_concurrency<double>(queue());
+}
+
+TEST_P(ADNSumTest, Sum_ScratchLeaseReentrancyAndException) {
+   using Lease = adn::detail::SumPartialsLease<double, 3>;
+   using Acc = adn::detail::Binned<double, 3>;
+   sycl::queue &q = queue();
+   const bool device_partials =
+      q.get_backend() == sycl::backend::ext_oneapi_cuda;
+   Acc *cached = nullptr;
+   EXPECT_THROW(([&] {
+      Lease outer(16, q, device_partials);
+      cached = outer.get();
+      q.memset(cached, 0x5a, 16 * sizeof(Acc)).wait_and_throw();
+      std::vector<double> input(257, 1.0);
+      EXPECT_BIT_EQ(adn::sum(q, input.data(), input.size()), 257.0);
+      std::vector<unsigned char> bytes(16 * sizeof(Acc));
+      q.memcpy(bytes.data(), cached, bytes.size()).wait_and_throw();
+      EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
+         [](unsigned char value) { return value == 0x5a; }));
+      throw std::runtime_error("injected lease failure");
+   }()),
+      std::runtime_error);
+   Lease after_exception(16, q, device_partials);
+   EXPECT_EQ(after_exception.get(), cached);
 }
 
 // ============================================================
@@ -2902,6 +3047,229 @@ TEST_P(ADNSumTest, Cumsum_SingleTilePathMatchesMultiTilePathAfterShuffle) {
    }
 }
 
+template <typename T> static void check_single_tile_in_place(sycl::queue &q) {
+   std::mt19937 rng(8067);
+   for (size_t N : {1, 8, 9, 257, 2048, 2049}) {
+      auto data = exact_quarter_input<T>(N);
+      auto device_input = adn::detail::allocate_device_usm<T>(N, q);
+      auto device_output = adn::detail::allocate_device_usm<T>(N + 2, q);
+      std::vector<T> expected(N);
+      std::vector<T> actual(N + 2);
+      for (int run = 0; run < 3; ++run) {
+         SCOPED_TRACE(
+            "N=" + std::to_string(N) + ", bytes=" + std::to_string(sizeof(T)));
+         std::shuffle(data.first.begin(), data.first.end(), rng);
+         std::int64_t units = 0;
+         for (size_t i = 0; i < N; ++i) {
+            units += static_cast<std::int64_t>(data.first[i] * T(4));
+            expected[i] = T(units) * T(0.25);
+         }
+         EXPECT_BIT_EQ(expected.back(), data.second);
+
+         const sycl::event copied =
+            q.memcpy(device_input.get(), data.first.data(), N * sizeof(T));
+         const sycl::event initialized =
+            q.fill(device_output.get(), T(-99), N + 2);
+         adn::cumsum(q, device_input.get(), device_output.get() + 1, N,
+            {copied, initialized});
+         q.memcpy(actual.data(), device_output.get(), (N + 2) * sizeof(T))
+            .wait_and_throw();
+         EXPECT_BIT_EQ(actual.front(), T(-99));
+         EXPECT_BIT_EQ(actual.back(), T(-99));
+         for (size_t i = 0; i < N; ++i) {
+            EXPECT_BIT_EQ(actual[i + 1], expected[i]) << "prefix " << i;
+         }
+
+         const sycl::event ready =
+            q.memcpy(device_input.get(), data.first.data(), N * sizeof(T));
+         adn::cumsum(q, device_input.get(), device_input.get(), N, {ready});
+         q.memcpy(actual.data(), device_input.get(), N * sizeof(T))
+            .wait_and_throw();
+         for (size_t i = 0; i < N; ++i) {
+            EXPECT_BIT_EQ(actual[i], expected[i]) << "in-place prefix " << i;
+         }
+      }
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_SingleTileDeviceInPlaceAfterShuffle) {
+   check_single_tile_in_place<float>(queue());
+   check_single_tile_in_place<double>(queue());
+}
+
+template <typename T>
+static void check_single_tile_exact_prefixes(sycl::queue &q) {
+   auto data = exact_quarter_input<T>(1025);
+   std::vector<T> output(data.first.size());
+   std::mt19937 rng(8068);
+   for (int run = 0; run < 3; ++run) {
+      std::shuffle(data.first.begin(), data.first.end(), rng);
+      // Interleave reductions and scans to detect accidental cache sharing.
+      EXPECT_BIT_EQ(
+         adn::sum(q, data.first.data(), data.first.size()), data.second);
+      adn::cumsum(q, data.first.data(), output.data(), data.first.size());
+      std::int64_t units = 0;
+      for (size_t i = 0; i < output.size(); ++i) {
+         units += static_cast<std::int64_t>(data.first[i] * T(4));
+         EXPECT_BIT_EQ(output[i], T(units) * T(0.25)) << "prefix " << i;
+      }
+      EXPECT_BIT_EQ(output.back(), data.second);
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_SingleTileScratchContextAndQueueSwitch) {
+   const sycl::device device = queue().get_device();
+   sycl::context first_context(device);
+   sycl::context second_context(device);
+   sycl::queue first(first_context, device);
+   sycl::queue same_context(first_context, device);
+   sycl::queue second(second_context, device);
+   for (sycl::queue *q : {&first, &same_context, &second, &first}) {
+      check_single_tile_exact_prefixes<float>(*q);
+      check_single_tile_exact_prefixes<double>(*q);
+   }
+}
+
+TEST_P(ADNSumTest, Cumsum_SingleTileScratchLeaseReentrancyAndException) {
+   using Lease = adn::detail::SumPartialsLease<double, 3, true>;
+   using Acc = adn::detail::Binned<double, 3>;
+   sycl::queue &q = queue();
+   Acc *cached = nullptr;
+   EXPECT_THROW(([&] {
+      Lease outer(1, q, true);
+      cached = outer.get();
+      {
+         Lease nested(1, q, true);
+         EXPECT_NE(nested.get(), cached);
+      }
+      check_single_tile_exact_prefixes<double>(q);
+      throw std::runtime_error("injected zero-prefix lease failure");
+   }()),
+      std::runtime_error);
+   {
+      Lease after_exception(1, q, true);
+      EXPECT_EQ(after_exception.get(), cached);
+      std::array<unsigned char, sizeof(Acc)> bytes;
+      q.memcpy(bytes.data(), after_exception.get(), bytes.size())
+         .wait_and_throw();
+      EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
+         [](unsigned char value) { return value == 0; }));
+   }
+   check_single_tile_exact_prefixes<double>(q);
+}
+
+static std::array<void *, 4> shared_scratch_addresses(sycl::queue &q) {
+   // Device allocation pools may still report freed device ranges as USM.
+   // Request shared storage so the release checks below observe the leases.
+   adn::detail::SumPartialsLease<float, 3> sum_float(1, q, false);
+   adn::detail::SumPartialsLease<double, 3> sum_double(1, q, false);
+   adn::detail::SumPartialsLease<float, 3, true> scan_float(1, q, false);
+   adn::detail::SumPartialsLease<double, 3, true> scan_double(1, q, false);
+   return {
+      sum_float.get(), sum_double.get(), scan_float.get(), scan_double.get()};
+}
+
+static void check_scratch_released(
+   sycl::queue &q, const std::array<void *, 4> &addresses) {
+   for (void *address : addresses) {
+      EXPECT_EQ(sycl::get_pointer_type(address, q.get_context()),
+         sycl::usm::alloc::unknown);
+   }
+}
+
+static void check_scratch_leases_during_exit(sycl::queue &q) {
+   // Each later lease must release its allocation instead of reviving a cache
+   // whose destructor will never run again. Repeat to check subsequent calls.
+   check_scratch_released(q, shared_scratch_addresses(q));
+   check_scratch_released(q, shared_scratch_addresses(q));
+}
+
+TEST_P(ADNSumTest, ScratchCallsDuringThreadExit) {
+   sycl::queue &q = queue();
+   std::exception_ptr failure;
+   bool called = false;
+   struct OnExit {
+      std::function<void()> check;
+      std::exception_ptr &failure;
+      ~OnExit() {
+         if (!failure) {
+            try {
+               check();
+            } catch (...) {
+               failure = std::current_exception();
+            }
+         }
+      }
+   };
+
+   std::thread worker([&] {
+      try {
+         // Keep the SYCL runtime's own TLS alive through the callback by
+         // warming it first, using a different accumulator specialization.
+         float warmup = 1.0f;
+         EXPECT_BIT_EQ((adn::sum<4>(q, &warmup, 1)), warmup);
+         // Construct the caller's object before the four K=3 caches so it
+         // runs after their destruction, while the runtime is still alive.
+         thread_local OnExit on_exit{[&] {
+            called = true;
+            check_single_tile_exact_prefixes<float>(q);
+            check_single_tile_exact_prefixes<double>(q);
+            check_scratch_leases_during_exit(q);
+         }, failure};
+         check_single_tile_exact_prefixes<float>(q);
+         check_single_tile_exact_prefixes<double>(q);
+         shared_scratch_addresses(q);
+      } catch (...) {
+         failure = std::current_exception();
+      }
+   });
+   worker.join();
+   if (failure) {
+      std::rethrow_exception(failure);
+   }
+   EXPECT_TRUE(called);
+}
+
+TEST_P(ADNSumTest, ScratchLeasesDuringProcessExit) {
+#ifdef GTEST_HAS_DEATH_TEST
+   // Re-exec the child instead of using an initialized SYCL runtime after fork.
+   GTEST_FLAG_SET(death_test_style, "threadsafe");
+   ASSERT_EXIT(
+      {
+         sycl::queue &q = queue();
+         check_single_tile_exact_prefixes<float>(q);
+         check_single_tile_exact_prefixes<double>(q);
+         shared_scratch_addresses(q);
+         struct OnExit {
+            std::function<void()> check;
+            ~OnExit() {
+               try {
+                  check();
+               } catch (const std::exception &error) {
+                  std::fprintf(stderr, "%s\n", error.what());
+                  std::_Exit(2);
+               } catch (...) {
+                  std::_Exit(2);
+               }
+               // Report assertions to the parent before unrelated globals
+               // begin their cleanup. std::exit has already destroyed TLS.
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+            }
+         };
+         // Register after warming validation so its static state and the SYCL
+         // runtime still exist when this destructor runs. std::exit leaves
+         // the automatic variables captured by the callback alive.
+         // Kernel submission may depend on the runtime's own destroyed TLS.
+         // Test the leases here; the thread-exit case checks the public APIs.
+         static OnExit on_exit{[&] { check_scratch_leases_during_exit(q); }};
+         std::exit(0);
+      },
+      ::testing::ExitedWithCode(0), "");
+#else
+   GTEST_SKIP() << "Process-exit tests are not supported on this platform";
+#endif
+}
+
 TEST_P(ADNSumTest, Cumsum_GenericLargeTileBitIdenticalAfterShuffle) {
    expect_large_cumsum_tile_after_shuffle<double>(queue());
    expect_large_cumsum_tile_after_shuffle<float>(queue());
@@ -3792,7 +4160,7 @@ TEST(Version, MacroEncoding) {
    EXPECT_EQ(SYCL_REPRO_SUM_VERSION,
       SYCL_REPRO_SUM_VERSION_MAJOR * 10000 +
          SYCL_REPRO_SUM_VERSION_MINOR * 100 + SYCL_REPRO_SUM_VERSION_PATCH);
-   EXPECT_GE(SYCL_REPRO_SUM_VERSION, 10300); // at least 1.3.0
+   EXPECT_GE(SYCL_REPRO_SUM_VERSION, 10400); // at least 1.4.0
    EXPECT_EQ(adn::max_reproducible_count<float>, UINT64_C(4294966784));
    EXPECT_EQ(
       adn::max_reproducible_count<double>, UINT64_C(9223372036854773760));

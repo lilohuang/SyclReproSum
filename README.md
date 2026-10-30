@@ -127,8 +127,8 @@ bias of GB/s.
 | Measured devices | DPC++ / Clang | Compiler revision | oneDPL |
 |---|---|---|---|
 | NVIDIA GB10 | 7.1.0 / 23 | `ca38ac56d6e3` | 2022.12.0 |
-| Intel Arc Pro B70 | 7.1.0 / 23 | `95ec82a14309` | 2022.13.0 |
-| RTX PRO 4500, W7500, Core Ultra 7 265 CPU and iGPU | 7.2.0 / 24 | `f3aadb6ba275` | 2022.13.0 |
+| Intel Arc Pro B70 | 7.1.0 / 23 | `95ec82a14309` | 2022.13 |
+| RTX PRO 4500, W7500, Core Ultra 7 265 CPU and iGPU | 7.2.0 / 24 | `c965e6905920` | 2022.10 |
 
 Once a default cumulative sum would require at least 32K of the original tiles
 (about 67M elements), every device uses 16 contiguous elements per work-item
@@ -159,10 +159,10 @@ algorithm baseline and is therefore not reported here.
 
 | Device / type | N=1 | N=64 | N=1,024 | N=2,048 | N=2,049 |
 |---|---:|---:|---:|---:|---:|
-| NVIDIA GB10 (CUDA), `double` | 17.6 / 25.0 (1.42x faster) | 24.6 / 23.2 (1.06x slower) | 28.7 / 32.9 (1.15x faster) | 28.8 / 42.2 (1.46x faster) | 29.1 / 41.9 (1.44x faster) |
-| NVIDIA GB10 (CUDA), `float` | 16.9 / 23.2 (1.37x faster) | 24.8 / 23.5 (1.05x slower) | 28.6 / 24.3 (1.18x slower) | 28.6 / 26.3 (1.09x slower) | 28.8 / 26.0 (1.11x slower) |
-| NVIDIA RTX PRO 4500 Blackwell (CUDA), `double` | 14.5 / 18.8 (1.30x faster) | 22.2 / 18.7 (1.18x slower) | 25.2 / 26.6 (1.06x faster) | 25.1 / 34.9 (1.39x faster) | 25.1 / 34.8 (1.39x faster) |
-| NVIDIA RTX PRO 4500 Blackwell (CUDA), `float` | 14.1 / 18.6 (1.31x faster) | 15.5 / 18.3 (1.19x faster) | 24.6 / 19.4 (1.27x slower) | 24.6 / 20.6 (1.19x slower) | 24.6 / 20.6 (1.19x slower) |
+| NVIDIA GB10 (CUDA), `double` | 15.5 / 24.8 (1.61x faster) | 23.2 / 22.7 (1.03x slower) | 26.6 / 31.6 (1.19x faster) | 26.8 / 41.6 (1.56x faster) | 27.4 / 41.0 (1.49x faster) |
+| NVIDIA GB10 (CUDA), `float` | 14.8 / 22.9 (1.55x faster) | 22.6 / 22.4 (1.01x slower) | 26.7 / 23.6 (1.13x slower) | 26.7 / 25.4 (1.05x slower) | 26.6 / 25.0 (1.07x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA), `double` | 12.5 / 17.2 (1.38x faster) | 20.6 / 16.8 (1.22x slower) | 23.4 / 24.0 (1.03x faster) | 23.2 / 32.9 (1.42x faster) | 23.5 / 33.1 (1.41x faster) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA), `float` | 12.2 / 17.0 (1.40x faster) | 12.6 / 16.9 (1.34x faster) | 23.5 / 17.4 (1.35x slower) | 23.4 / 18.7 (1.25x slower) | 23.3 / 18.9 (1.23x slower) |
 
 The CUDA scalar path can beat the generic reduction for several `double`
 sizes because it keeps partials in device USM and copies back only the final
@@ -172,14 +172,14 @@ scalar. The advantage is modest and is not uniform across types or sizes.
 
 | Device / type | N=1 | N=64 | N=1,024 | N=2,048 | N=2,049 |
 |---|---:|---:|---:|---:|---:|
-| NVIDIA GB10 (CUDA), `double` | 24.1 / 10.9 (2.21x slower) | 40.8 / 10.6 (3.85x slower) | 49.1 / 19.8 (2.48x slower) | 60.2 / 29.3 (2.05x slower) | 92.7 / 25.2 (3.67x slower) |
-| NVIDIA GB10 (CUDA), `float` | 21.7 / 10.4 (2.10x slower) | 35.8 / 10.0 (3.56x slower) | 38.6 / 11.1 (3.49x slower) | 50.0 / 12.4 (4.04x slower) | 72.6 / 26.3 (2.77x slower) |
-| NVIDIA RTX PRO 4500 Blackwell (CUDA), `double` | 21.3 / 9.2 (2.32x slower) | 36.1 / 8.8 (4.08x slower) | 44.5 / 17.2 (2.59x slower) | 54.9 / 26.4 (2.08x slower) | 82.3 / 21.8 (3.77x slower) |
-| NVIDIA RTX PRO 4500 Blackwell (CUDA), `float` | 19.1 / 8.7 (2.20x slower) | 31.7 / 8.6 (3.68x slower) | 34.0 / 9.4 (3.61x slower) | 44.3 / 10.6 (4.20x slower) | 64.4 / 22.7 (2.84x slower) |
-| Intel Arc Pro B70 (Level-Zero), `double` | 94.0 / 42.8 (2.20x slower) | 109.8 / 42.9 (2.56x slower) | 118.3 / 46.1 (2.56x slower) | 119.5 / 47.6 (2.51x slower) | 190.5 / 55.9 (3.41x slower) |
-| Intel Arc Pro B70 (Level-Zero), `float` | 92.8 / 42.0 (2.21x slower) | 106.6 / 41.6 (2.56x slower) | 114.8 / 43.1 (2.66x slower) | 119.9 / 46.0 (2.61x slower) | 183.4 / 57.1 (3.21x slower) |
-| Intel Core Ultra 7 265 iGPU (Level-Zero), `double` | 242.8 / 91.3 (2.66x slower) | 300.2 / 93.8 (3.20x slower) | 331.0 / 108.8 (3.04x slower) | 351.4 / 122.3 (2.87x slower) | 509.3 / 222.3 (2.29x slower) |
-| Intel Core Ultra 7 265 iGPU (Level-Zero), `float` | 243.1 / 91.3 (2.66x slower) | 287.8 / 92.6 (3.11x slower) | 304.2 / 101.3 (3.00x slower) | 318.0 / 110.9 (2.87x slower) | 456.3 / 184.2 (2.48x slower) |
+| NVIDIA GB10 (CUDA), `double` | 17.0 / 10.8 (1.57x slower) | 33.7 / 10.4 (3.22x slower) | 41.8 / 19.7 (2.12x slower) | 52.9 / 29.3 (1.81x slower) | 93.2 / 25.2 (3.69x slower) |
+| NVIDIA GB10 (CUDA), `float` | 14.3 / 10.1 (1.41x slower) | 28.3 / 10.1 (2.81x slower) | 31.5 / 11.0 (2.86x slower) | 42.7 / 12.3 (3.46x slower) | 72.5 / 26.3 (2.76x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA), `double` | 14.3 / 9.1 (1.58x slower) | 25.3 / 8.7 (2.91x slower) | 33.6 / 16.7 (2.01x slower) | 45.3 / 26.0 (1.74x slower) | 77.1 / 22.0 (3.51x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA), `float` | 12.2 / 8.7 (1.41x slower) | 21.4 / 8.3 (2.57x slower) | 26.5 / 9.1 (2.91x slower) | 37.9 / 10.8 (3.49x slower) | 63.0 / 22.8 (2.76x slower) |
+| Intel Arc Pro B70 (Level-Zero), `double` | 66.9 / 56.5 (1.18x slower) | 71.5 / 46.3 (1.55x slower) | 88.2 / 58.6 (1.50x slower) | 90.4 / 57.3 (1.58x slower) | 195.5 / 56.8 (3.44x slower) |
+| Intel Arc Pro B70 (Level-Zero), `float` | 53.6 / 43.9 (1.22x slower) | 69.6 / 45.3 (1.54x slower) | 79.3 / 50.2 (1.58x slower) | 79.7 / 49.2 (1.62x slower) | 195.4 / 58.5 (3.34x slower) |
+| Intel Core Ultra 7 265 iGPU (Level-Zero), `double` | 152.2 / 91.4 (1.66x slower) | 206.8 / 92.7 (2.23x slower) | 231.3 / 104.0 (2.22x slower) | 258.4 / 123.1 (2.10x slower) | 509.1 / 226.5 (2.25x slower) |
+| Intel Core Ultra 7 265 iGPU (Level-Zero), `float` | 126.5 / 80.9 (1.56x slower) | 164.3 / 81.5 (2.02x slower) | 213.9 / 103.3 (2.07x slower) | 222.8 / 108.3 (2.06x slower) | 453.0 / 182.7 (2.48x slower) |
 
 With the default work-group size, one tile contains 2,048 elements. CUDA and
 Level Zero therefore use the fast path through `N=2048`; `N=2049` is the
@@ -191,12 +191,12 @@ a conventional oneDPL scan at these sizes.
 
 | Device (backend) | `double` sum / baseline* (GElements/s) | `float` sum / baseline* (GElements/s) |
 |---|---:|---:|
-| NVIDIA GB10 (CUDA) | 25.5 / 31.2 (1.2x slower) | 55.4 / 62.1 (1.1x slower) |
-| NVIDIA RTX PRO 4500 Blackwell (CUDA) | 50.5 / 78.2 (1.5x slower) | 135.1 / 126.4 (1.1x faster) |
-| AMD Radeon Pro W7500 (HIP) | 9.3 / 14.5 (1.6x slower) | 16.0 / 19.1 (1.2x slower) |
-| Intel Arc Pro B70 (Level-Zero) | 26.7 / 57.3 (2.1x slower) | 54.2 / 98.5 (1.8x slower) |
-| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 1.8 / 6.6 (3.6x slower) | 5.0 / 12.9 (2.6x slower) |
-| Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.6 (13.8x slower) | 0.6 / 7.7 (13.1x slower) |
+| NVIDIA GB10 (CUDA) | 25.6 / 31.6 (1.2x slower) | 55.1 / 61.7 (1.1x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA) | 50.7 / 77.0 (1.5x slower) | 136.9 / 129.3 (1.1x faster) |
+| AMD Radeon Pro W7500 (HIP) | 9.4 / 14.9 (1.6x slower) | 15.8 / 21.4 (1.3x slower) |
+| Intel Arc Pro B70 (Level-Zero) | 31.9 / 58.5 (1.8x slower) | 94.6 / 95.3 (1.0x slower) |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 1.8 / 6.6 (3.6x slower) | 5.1 / 12.9 (2.5x slower) |
+| Intel Core Ultra 7 265 CPU (OpenCL) | 0.4 / 5.7 (13.0x slower) | 0.7 / 7.7 (11.6x slower) |
 
 *Baseline = plain (non-reproducible) `sycl::reduction` of the same data
 type on the same device. It is a comparison point, not a hard performance
@@ -220,12 +220,12 @@ provide the reproducibility guarantees of `adn::cumsum`.
 
 | Device (backend) | `double` cumsum / baseline* (GElements/s) | `float` cumsum / baseline* (GElements/s) |
 |---|---:|---:|
-| NVIDIA GB10 (CUDA) | 2.524 / 7.756 (3.1x slower) | 3.500 / 13.868 (4.0x slower) |
-| NVIDIA RTX PRO 4500 Blackwell (CUDA) | 5.304 / 21.563 (4.1x slower) | 6.815 / 40.780 (6.0x slower) |
-| AMD Radeon Pro W7500 (HIP) | 0.818 / 4.910 (6.0x slower) | 1.181 / 9.127 (7.7x slower) |
-| Intel Arc Pro B70 (Level-Zero) | 3.926 / 19.280 (4.9x slower) | 7.181 / 43.274 (6.0x slower) |
-| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 0.191 / 0.610 (3.2x slower) | 0.357 / 2.445 (6.9x slower) |
-| Intel Core Ultra 7 265 CPU (OpenCL) | 0.144 / 1.497 (10.4x slower) | 0.173 / 2.525 (14.6x slower) |
+| NVIDIA GB10 (CUDA) | 2.510 / 7.764 (3.1x slower) | 3.489 / 13.856 (4.0x slower) |
+| NVIDIA RTX PRO 4500 Blackwell (CUDA) | 5.260 / 21.034 (4.0x slower) | 6.759 / 39.137 (5.8x slower) |
+| AMD Radeon Pro W7500 (HIP) | 0.817 / 4.833 (5.9x slower) | 1.179 / 9.109 (7.7x slower) |
+| Intel Arc Pro B70 (Level-Zero) | 3.738 / 18.284 (4.9x slower) | 6.793 / 41.425 (6.1x slower) |
+| Intel Core Ultra 7 265 iGPU (Xe-LPG, Level-Zero) | 0.192 / 0.609 (3.2x slower) | 0.356 / 2.445 (6.9x slower) |
+| Intel Core Ultra 7 265 CPU (OpenCL) | 0.159 / 1.494 (9.4x slower) | 0.193 / 3.058 (15.8x slower) |
 
 *Baseline = oneDPL `inclusive_scan` of the same data type on the same device.
 The slowdown factor is `baseline / cumsum`.
@@ -365,11 +365,24 @@ Detection is done at runtime via `sycl::get_pointer_type`. "No library-side
 copy" does not guarantee a physical zero-copy implementation; the SYCL
 runtime may migrate or otherwise manage USM storage.
 
-Every valid, nonempty operation requires shared USM for internal accumulators.
-`adn::cumsum` also requires device USM for its temporary arrays, while
-`adn::sum` requires device USM only when copying a plain host pointer. The
+Every valid, nonempty operation requires shared USM for environment validation.
+`adn::cumsum` also requires device USM, while `adn::sum` requires device USM
+for CUDA reduction partials and when copying a plain host pointer. The
 library checks these capabilities and throws `std::runtime_error` with the
 missing requirement instead of relying on an allocation failure.
+
+`adn::sum` automatically reuses one reduction buffer per host thread and
+`(T, K)` combination. The buffer is bound to its context and device, grows
+to the largest grid used there, and is replaced when either changes. It holds
+at most 2,048 binned accumulators and is released when replaced or when the
+thread exits; its context remains alive until then. Every call overwrites all
+partials it reads. Concurrent threads have separate buffers, and reentrant
+calls use a separate temporary allocation until the outer call completes.
+Single-tile CUDA and Level Zero cumulative sums similarly retain a separate
+zero-prefix buffer. Calls made after a cache is destroyed during thread or
+process shutdown use temporary allocations released before returning.
+The queue and SYCL runtime must still be usable during such calls.
+The public API and synchronous completion guarantee are unchanged.
 
 For overloads without an explicit dependency list, the caller must ensure
 that prior operations writing a USM input, or otherwise conflicting with a
@@ -565,6 +578,7 @@ compiler installation. This is the local workaround for
 | `make` / `make example` | Build the usage example (`repro_example`) |
 | `make test` | Build and run Google Test suite |
 | `make test-validation` | Run hostile host/device validation tests |
+| `make test-initcheck` | Check CUDA global/shared memory initialization with Compute Sanitizer |
 | `make all` | Build both example and tests |
 | `make run` | Build and run the example |
 | `make clean` | Remove binaries and build artifacts |
@@ -603,8 +617,8 @@ The Google Test suite chooses one preferred backend per distinct device name
 (Level-Zero, then CUDA, then other backends, with OpenCL as the fallback).
 Each correctness case runs once per selected CPU or GPU from a single fat
 binary (CUDA + SPIR-V + AMDGCN by default), plus cross-device bit-identity
-tests and performance benchmarks. There are 189 correctness cases and 8
-benchmarks per device, plus 11 cross-device cases and one version test: 800
+tests and performance benchmarks. There are 198 correctness cases and 8
+benchmarks per device, plus 11 cross-device cases and one version test: 836
 tests on a system with three GPUs and one CPU. Four benchmarks measure 100M
 element throughput and four measure small-N latency. The `WG_SIZE=1024` cases
 skip on a device whose work-group or local memory limits cannot support that
@@ -631,8 +645,22 @@ make test
 # Rebuild and test hostile host/device floating-point modes
 make test-validation
 
+# Check every CUDA correctness case for uninitialized global/shared reads
+# Requires Compute Sanitizer with --initcheck-address-space support.
+make test-initcheck
+
+# Older Compute Sanitizer versions check global memory only. For versions
+# without --initcheck-address-space, explicitly omit that option:
+make test-initcheck INITCHECK_FLAGS=
+
+# Run just the scratch-reuse and single-tile initialization checks
+make test-initcheck INITCHECK_FILTER='*Scratch*:*SingleTile*'
+
 # Run the normal suite and all validation variants
 make test test-validation
+
+# Select another installed oneDPL version for the benchmark baseline
+make test ONEDPL_INC=/opt/intel/oneapi/dpl/2022.10/include
 
 # Filter specific tests (e.g. float only)
 LD_LIBRARY_PATH=$DPCPP_HOME/llvm/build/lib ./repro_test --gtest_filter="*Float*"

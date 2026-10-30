@@ -8,6 +8,7 @@
 #    make all        - build both example and test
 #    make run        - build & run example
 #    make test-validation - run hostile host/device validation tests
+#    make test-initcheck - check CUDA memory initialization
 #    make clean      - remove binaries
 #    make gtest      - build gtest from bundled source (once)
 #
@@ -145,6 +146,10 @@ HOSTILE_HOST_FLAGS = \
 	-Xarch_host -fno-signed-zeros \
 	-Xarch_host -ffp-eval-method=double
 
+COMPUTE_SANITIZER ?= compute-sanitizer
+INITCHECK_FILTER  ?= -*Bench*
+INITCHECK_FLAGS   ?= --initcheck-address-space all
+
 # Google Test (git submodule)
 GTEST_DIR    = third_party/googletest
 GTEST_BUILD  = $(CURDIR)/build/gtest-build
@@ -168,7 +173,7 @@ export ONEAPI_DEVICE_SELECTOR
 
 # ---- Targets ------------------------------------------------
 
-.PHONY: all example test test-validation test-hostile-host \
+.PHONY: all example test test-validation test-initcheck test-hostile-host \
 	test-unsafe-device test-device-denorm test-device-noszero \
 	test-device-eval test-mixed-tu-validation run clean gtest check-config \
 	prepare-toolchain FORCE
@@ -193,6 +198,18 @@ run: repro_example
 
 test: repro_test
 	./repro_test
+
+test-initcheck: repro_test
+ifeq ($(NVIDIA_TARGET_ENABLED),)
+	@echo "test-initcheck requires the NVIDIA SYCL target"
+	@exit 2
+else
+	# Use fork/exec so Compute Sanitizer can follow Google Test subprocesses.
+	GTEST_DEATH_TEST_USE_FORK=1 ONEAPI_DEVICE_SELECTOR='cuda:*' \
+		$(COMPUTE_SANITIZER) --tool initcheck \
+		$(INITCHECK_FLAGS) --error-exitcode 1 \
+		./repro_test "--gtest_filter=$(INITCHECK_FILTER)" --gtest_brief=1
+endif
 
 check-config:
 	@echo "SYCL targets: $(SYCL_TARGETS)"
